@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Brooklyn Rent Stabilized Buildings</title>
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.5.3/dist/MarkerCluster.Default.css" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" />
+
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; display: flex; flex-direction: column; height: 100vh; }
+
+    #controls {
+      background: #1a1a2e;
+      color: #eee;
+      padding: 10px 16px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      z-index: 1000;
+      flex-shrink: 0;
+    }
+
+    #controls h1 { font-size: 14px; font-weight: 600; white-space: nowrap; color: #fff; margin-right: 4px; }
+
+    .ctrl-group { display: flex; align-items: center; gap: 6px; }
+    .ctrl-group label { font-size: 12px; color: #aaa; white-space: nowrap; }
+
+    select {
+      background: #2a2a4a;
+      color: #eee;
+      border: 1px solid #444;
+      border-radius: 4px;
+      padding: 4px 8px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+    select[multiple] { height: 28px; min-width: 140px; }
+
+    button {
+      background: #4a6fa5;
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      padding: 5px 12px;
+      font-size: 12px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    button:hover { background: #5a7fb5; }
+    button.danger { background: #7a3535; }
+    button.danger:hover { background: #9a4545; }
+    button.active { background: #2e7d32; }
+
+    #status { font-size: 12px; color: #aaa; white-space: nowrap; margin-left: auto; }
+
+    #map { flex: 1; }
+
+    /* Bounding-box info bar */
+    #bbox-bar {
+      display: none;
+      background: #0d2d0d;
+      color: #8bc34a;
+      font-size: 12px;
+      padding: 4px 16px;
+      text-align: center;
+    }
+
+    /* Zip multi-select styling */
+    #zip-select { height: auto; }
+  </style>
+</head>
+<body>
+  <div id="controls">
+    <h1>Brooklyn Rent Stabilized Buildings</h1>
+
+    <div class="ctrl-group">
+      <label>Zip codes:</label>
+      <select id="zip-select" multiple size="1" title="Hold Cmd/Ctrl to select multiple">
+        <option value="">All zips</option>
+      </select>
+    </div>
+
+    <div class="ctrl-group">
+      <button id="btn-bbox" title="Draw a rectangle on the map to filter">Draw bounding box</button>
+      <button id="btn-clear-bbox" class="danger" style="display:none">Clear box</button>
+    </div>
+
+    <div class="ctrl-group">
+      <button id="btn-reset">Reset all filters</button>
+    </div>
+
+    <span id="status">Loading…</span>
+  </div>
+
+  <div id="bbox-bar">Bounding box active — showing buildings inside drawn rectangle</div>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet.markercluster@1.5.3/dist/leaflet.markercluster.js"></script>
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+  <script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+
+  <script>
+    // ── Map setup ──────────────────────────────────────────────────────────
+    const map = L.map('map').setView([40.6501, -73.9496], 12);
+
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+      attribution: '© OpenStreetMap contributors © CARTO',
+      maxZoom: 19,
+    }).addTo(map);
+
+    // ── State ──────────────────────────────────────────────────────────────
+    let allBuildings = [];
+    let activeZips = new Set();
+    let activeBbox = null; // L.LatLngBounds or null
+
+    // ── Marker cluster group ───────────────────────────────────────────────
+    const clusters = L.markerClusterGroup({
+      chunkedLoading: true,
+      maxClusterRadius: 40,
+    });
+    map.addLayer(clusters);
+
+    // ── Leaflet.Draw for bounding box ──────────────────────────────────────
+    const drawnItems = new L.FeatureGroup();
+    map.addLayer(drawnItems);
+
+    const drawControl = new L.Control.Draw({
+      draw: {
+        polyline: false,
+        polygon: false,
+        circle: false,
+        circlemarker: false,
+        marker: false,
+        rectangle: { shapeOptions: { color: '#8bc34a', weight: 2 } },
+      },
+      edit: { featureGroup: drawnItems, edit: false, remove: false },
+    });
+
+    const btnBbox = document.getElementById('btn-bbox');
+    const btnClearBbox = document.getElementById('btn-clear-bbox');
+    const bboxBar = document.getElementById('bbox-bar');
+    let drawingMode = false;
+
+    btnBbox.addEventListener('click', () => {
+      if (drawingMode) {
+        map._toolbars[Object.keys(map._toolbars)[0]]?.disable?.();
+        drawingMode = false;
+        btnBbox.classList.remove('active');
+        btnBbox.textContent = 'Draw bounding box';
+      } else {
+        new L.Draw.Rectangle(map, drawControl.options.draw.rectangle).enable();
+        drawingMode = true;
+        btnBbox.classList.add('active');
+        btnBbox.textContent = 'Cancel drawing';
+      }
+    });
+
+    map.on(L.Draw.Event.CREATED, (e) => {
+      drawnItems.clearLayers();
+      drawnItems.addLayer(e.layer);
+      activeBbox = e.layer.getBounds();
+      drawingMode = false;
+      btnBbox.classList.remove('active');
+      btnBbox.textContent = 'Draw bounding box';
+      btnClearBbox.style.display = '';
+      bboxBar.style.display = '';
+      applyFilters();
+    });
+
+    btnClearBbox.addEventListener('click', () => {
+      drawnItems.clearLayers();
+      activeBbox = null;
+      btnClearBbox.style.display = 'none';
+      bboxBar.style.display = 'none';
+      applyFilters();
+    });
+
+    // ── Zip filter ─────────────────────────────────────────────────────────
+    const zipSelect = document.getElementById('zip-select');
+
+    function getSelectedZips() {
+      const selected = Array.from(zipSelect.selectedOptions).map(o => o.value).filter(Boolean);
+      return new Set(selected);
+    }
+
+    zipSelect.addEventListener('change', () => {
+      activeZips = getSelectedZips();
+      applyFilters();
+    });
+
+    // ── Reset ──────────────────────────────────────────────────────────────
+    document.getElementById('btn-reset').addEventListener('click', () => {
+      Array.from(zipSelect.options).forEach(o => o.selected = false);
+      activeZips = new Set();
+      drawnItems.clearLayers();
+      activeBbox = null;
+      btnClearBbox.style.display = 'none';
+      bboxBar.style.display = 'none';
+      applyFilters();
+    });
+
+    // ── Filter + render ────────────────────────────────────────────────────
+    function applyFilters() {
+      const filtered = allBuildings.filter(b => {
+        if (activeZips.size > 0 && !activeZips.has(b.zip)) return false;
+        if (activeBbox && !activeBbox.contains([b.lat, b.lng])) return false;
+        return true;
+      });
+
+      clusters.clearLayers();
+
+      const markers = filtered.map(b => {
+        const m = L.circleMarker([b.lat, b.lng], {
+          radius: 5,
+          fillColor: '#e53935',
+          color: '#ff8a80',
+          weight: 0.5,
+          fillOpacity: 0.85,
+        });
+        m.bindPopup(
+          `<strong>${b.address}</strong><br>` +
+          `Zip: ${b.zip}<br>` +
+          (b.status ? `Status: ${b.status}` : ''),
+          { maxWidth: 200 }
+        );
+        return m;
+      });
+
+      clusters.addLayers(markers);
+      document.getElementById('status').textContent =
+        `${filtered.length.toLocaleString()} of ${allBuildings.length.toLocaleString()} buildings`;
+    }
+
+    // ── Load CSV ───────────────────────────────────────────────────────────
+    Papa.parse('bklyn_rent_stabilized_buildings.csv', {
+      download: true,
+      header: true,
+      skipEmptyLines: true,
+      complete({ data }) {
+        const zipSet = new Set();
+
+        allBuildings = data
+          .map(row => {
+            const lat = parseFloat(row.LATITUDE);
+            const lng = parseFloat(row.LONGITUDE);
+            if (isNaN(lat) || isNaN(lng)) return null;
+            const zip = (row.ZIP || '').trim();
+            if (zip) zipSet.add(zip);
+            const statuses = [row.STATUS1, row.STATUS2, row.STATUS3]
+              .filter(Boolean).join(', ');
+            return {
+              lat, lng,
+              zip,
+              address: `${row.BUILDING_NO} ${row.STREET}, ${row.CITY || 'Brooklyn'}`,
+              status: statuses,
+            };
+          })
+          .filter(Boolean);
+
+        // Populate zip dropdown
+        const sortedZips = Array.from(zipSet).sort();
+        sortedZips.forEach(z => {
+          const opt = document.createElement('option');
+          opt.value = z;
+          opt.textContent = z;
+          zipSelect.appendChild(opt);
+        });
+
+        applyFilters();
+      },
+      error(err) {
+        document.getElementById('status').textContent = 'Error loading CSV';
+        console.error(err);
+      },
+    });
+  </script>
+</body>
+</html>

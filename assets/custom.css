@@ -1,0 +1,71 @@
+body {
+    background-color: #0f0f23 !important;
+    overflow: hidden;
+}
+
+/* Prevent white flash during tile load / zoom transitions */
+.leaflet-container {
+    background: #0f0f23 !important;
+}
+.leaflet-tile-pane {
+    background: #0f0f23;
+}
+
+/* Dark dropdown */
+.Select-control,
+.Select-menu-outer {
+    background-color: #1e1e3a !important;
+    color: #e0e0e0 !important;
+}
+
+/* ZIP boundary tooltip */
+.zip-tooltip {
+    background: #1a1a2e;
+    color: #90caf9;
+    border: 1px solid #4a6fa5;
+    font-size: 12px;
+    padding: 2px 8px;
+    border-radius: 3px;
+}
+
+/* Subway station tooltip */
+.subway-tooltip {
+    background: #111;
+    color: #fff;
+    border: 1px solid #555;
+    font-size: 12px;
+    padding: 3px 8px;
+    border-radius: 3px;
+    white-space: nowrap;
+}
+
+/* Draw toolbar dark */
+.leaflet-draw-toolbar a,
+.leaflet-draw-actions a {
+    background-color: #1a1a2e !important;
+    color: #ccc !important;
+    border-color: #333 !important;
+}
+.leaflet-draw-toolbar a:hover {
+    background-color: #2a2a4a !important;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 4px; }
+::-webkit-scrollbar-track { background: #0f0f23; }
+::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
+::-webkit-scrollbar-thumb:hover { background: #555; }
+
+/* Cluster markers */
+.marker-cluster-small,
+.marker-cluster-medium,
+.marker-cluster-large {
+    background-color: rgba(229, 57, 53, 0.4) !important;
+}
+.marker-cluster-small div,
+.marker-cluster-medium div,
+.marker-cluster-large div {
+    background-color: rgba(229, 57, 53, 0.8) !important;
+    color: #fff !important;
+    font-weight: bold;
+}
