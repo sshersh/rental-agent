@@ -140,7 +140,7 @@ window.dashExtensions = Object.assign({}, window.dashExtensions, {
                 return {
                     color: '#4a6fa5',
                     weight: 1.5,
-                    fillOpacity: 0,
+                    fill: false,
                     dashArray: '4'
                 };
             }

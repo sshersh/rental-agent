@@ -56,6 +56,11 @@ body {
 ::-webkit-scrollbar-thumb { background: #333; border-radius: 2px; }
 ::-webkit-scrollbar-thumb:hover { background: #555; }
 
+/* Selection shapes (drag bbox, subway radius) — never catch clicks */
+.non-interactive-shape {
+    pointer-events: none !important;
+}
+
 /* Cluster markers */
 .marker-cluster-small,
 .marker-cluster-medium,

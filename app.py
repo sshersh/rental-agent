@@ -192,7 +192,7 @@ function(feature, context) {
 zip_style_fn = assign("""
 function(feature, context) {
     if (!window._mainLeafletMap) window._mainLeafletMap = context.map;
-    return {color: '#4a6fa5', weight: 1.5, fillOpacity: 0, dashArray: '4'};
+    return {color: '#4a6fa5', weight: 1.5, fill: false, dashArray: '4'};
 }
 """)
 
@@ -247,7 +247,7 @@ SIDEBAR = html.Div(
                 dbc.Switch(
                     id="zip-toggle",
                     label="ZIP boundaries",
-                    value=True,
+                    value=False,
                     className="mb-1 small",
                 ),
                 html.Div(id="selection-status", className="small text-warning mt-1"),
@@ -695,46 +695,46 @@ def render_previews(shortlist, template):
     return items
 
 
-@callback(
-    Output("send-status", "children"),
-    Input("send-btn", "n_clicks"),
-    State("shortlist-store", "data"),
-    State({"type": "owner-email", "id": ALL}, "value"),
-    State("email-template", "value"),
-    prevent_initial_call=True,
-)
-def send_emails(_, shortlist, email_values, template):
-    if not shortlist:
-        return dbc.Alert("Shortlist is empty.", color="warning", duration=4000)
-    email_user = os.getenv("EMAIL_USER", "")
-    email_pass = os.getenv("EMAIL_APP_PASSWORD", "")
-    if not email_user or not email_pass:
-        return dbc.Alert(
-            "Set EMAIL_USER and EMAIL_APP_PASSWORD in a .env file.", color="danger"
-        )
-    recipients = [(b, e) for b, e in zip(shortlist, email_values or []) if e]
-    if not recipients:
-        return dbc.Alert("No owner emails entered — fill them in above.", color="warning")
-    sent, failed = 0, 0
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(email_user, email_pass)
-            for b, to_addr in recipients:
-                body = _interpolate(template or "", {**b, "sender_email": email_user})
-                msg = MIMEMultipart()
-                msg["From"] = email_user
-                msg["To"] = to_addr
-                msg["Subject"] = f"Apartment inquiry — {b.get('address', '')}"
-                msg.attach(MIMEText(body, "plain"))
-                try:
-                    server.sendmail(email_user, to_addr, msg.as_string())
-                    sent += 1
-                except Exception:
-                    failed += 1
-    except Exception as e:
-        return dbc.Alert(f"SMTP error: {e}", color="danger")
-    color = "success" if not failed else "warning"
-    return dbc.Alert(f"Sent {sent} · Failed {failed}", color=color, duration=6000)
+# @callback(
+#     Output("send-status", "children"),
+#     Input("send-btn", "n_clicks"),
+#     State("shortlist-store", "data"),
+#     State({"type": "owner-email", "id": ALL}, "value"),
+#     State("email-template", "value"),
+#     prevent_initial_call=True,
+# )
+# def send_emails(_, shortlist, email_values, template):
+#     if not shortlist:
+#         return dbc.Alert("Shortlist is empty.", color="warning", duration=4000)
+#     email_user = os.getenv("EMAIL_USER", "")
+#     email_pass = os.getenv("EMAIL_APP_PASSWORD", "")
+#     if not email_user or not email_pass:
+#         return dbc.Alert(
+#             "Set EMAIL_USER and EMAIL_APP_PASSWORD in a .env file.", color="danger"
+#         )
+#     recipients = [(b, e) for b, e in zip(shortlist, email_values or []) if e]
+#     if not recipients:
+#         return dbc.Alert("No owner emails entered — fill them in above.", color="warning")
+#     sent, failed = 0, 0
+#     try:
+#         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+#             server.login(email_user, email_pass)
+#             for b, to_addr in recipients:
+#                 body = _interpolate(template or "", {**b, "sender_email": email_user})
+#                 msg = MIMEMultipart()
+#                 msg["From"] = email_user
+#                 msg["To"] = to_addr
+#                 msg["Subject"] = f"Apartment inquiry — {b.get('address', '')}"
+#                 msg.attach(MIMEText(body, "plain"))
+#                 try:
+#                     server.sendmail(email_user, to_addr, msg.as_string())
+#                     sent += 1
+#                 except Exception:
+#                     failed += 1
+#     except Exception as e:
+#         return dbc.Alert(f"SMTP error: {e}", color="danger")
+#     color = "success" if not failed else "warning"
+#     return dbc.Alert(f"Sent {sent} · Failed {failed}", color=color, duration=6000)
 
 
 # ── Subway stop click → radius selection ──────────────────────────────────
@@ -749,7 +749,9 @@ def send_emails(_, shortlist, email_values, template):
     prevent_initial_call=True,
 )
 def handle_subway_click(click_data, clear_clicks, radius_km):
+    print(f"[handle_subway_click] triggered_id={ctx.triggered_id} click_data={click_data}", flush=True)
     if ctx.triggered_id == "clear-selection-btn":
+        print("  → clearing subway selection", flush=True)
         return None, {"display": "none"}, ""
     if not click_data:
         return no_update, no_update, no_update
@@ -759,6 +761,7 @@ def handle_subway_click(click_data, clear_clicks, radius_km):
     lng, lat = coords[0], coords[1]
     name = (click_data.get("properties") or {}).get("name", "station")
     sel = {"lat": lat, "lng": lng, "name": name}
+    print(f"  → setting subway selection: {sel}", flush=True)
     return sel, {"display": "block"}, f"Radius: {name}"
 
 
@@ -770,9 +773,12 @@ def handle_subway_click(click_data, clear_clicks, radius_km):
     Input("radius-slider", "value"),
 )
 def update_selection_shapes(bbox, subway_sel, radius_km):
+    triggered = [t["prop_id"] for t in (ctx.triggered or [])]
+    print(f"[update_selection_shapes] triggered={triggered} bbox={bbox} subway_sel={subway_sel} radius_km={radius_km}", flush=True)
     shapes = []
     status_parts = []
     if bbox:
+        print(f"  → rendering Rectangle bounds={bbox}", flush=True)
         bounds = [[bbox["min_lat"], bbox["min_lng"]], [bbox["max_lat"], bbox["max_lng"]]]
         shapes.append(dl.Rectangle(
             bounds=bounds,
@@ -782,9 +788,11 @@ def update_selection_shapes(bbox, subway_sel, radius_km):
             weight=2,
             dashArray="5",
             interactive=False,
+            className="non-interactive-shape",
         ))
         status_parts.append("⬛ bbox")
     if subway_sel:
+        print(f"  → rendering Circle center=({subway_sel['lat']},{subway_sel['lng']}) r={radius_km}km", flush=True)
         lat, lng = subway_sel["lat"], subway_sel["lng"]
         shapes.append(dl.Circle(
             center=[lat, lng],
@@ -795,6 +803,7 @@ def update_selection_shapes(bbox, subway_sel, radius_km):
             weight=2,
             dashArray="6",
             interactive=False,
+            className="non-interactive-shape",
         ))
         status_parts.append(f"◉ {subway_sel['name']}")
     status = " · ".join(status_parts) if status_parts else ""
@@ -814,6 +823,7 @@ app.clientside_callback(
                 window.dash_clientside.no_update
             ];
             window._mapSetupDone = true;
+            console.warn('━━━━━━━ MAPSETUP v7 LOADED ━━━━━━━ thresholds: move=20px commit=100px,150ms');
 
             /* Disable Leaflet dragging — we handle mouse ourselves */
             map.dragging.disable();
@@ -855,7 +865,7 @@ app.clientside_callback(
                    so both start and end use the SAME map state. Otherwise a map pan
                    between mousedown and mouseup (popup auto-pan, trackpad scroll)
                    makes startLL stale and produces a huge phantom bbox. */
-                startPx = {x: e.clientX, y: e.clientY, ox: cx, oy: cy};
+                startPx = {x: e.clientX, y: e.clientY, ox: cx, oy: cy, t: Date.now()};
                 isDragging = false;
 
                 overlay = document.createElement('div');
@@ -868,8 +878,8 @@ app.clientside_callback(
             document.addEventListener('mousemove', function(e) {
                 if (!startPx) return;
                 var dx = e.clientX - startPx.x, dy = e.clientY - startPx.y;
-                /* 100 px² ≈ 10 px radius — filters micro-movement on normal clicks */
-                if (!isDragging && dx*dx + dy*dy > 100) {
+                /* 400 px² = 20 px radius — only show overlay once user has clearly moved */
+                if (!isDragging && dx*dx + dy*dy > 400) {
                     isDragging = true;
                     if (overlay) overlay.style.display = 'block';
                 }
@@ -889,13 +899,18 @@ app.clientside_callback(
                 if (!startPx) return;
                 if (overlay) { overlay.remove(); overlay = null; }
 
-                /* Re-check actual pixel displacement at mouseup. isDragging only
-                   tracks whether mousemove ever exceeded threshold during the
-                   gesture; the cursor may have moved out and back, leaving a
-                   tiny effective drag. Require ≥20px end-displacement to commit
-                   a bbox, otherwise treat as a click. */
+                /* Commit a bbox only if ALL of:
+                   (a) isDragging was set during mousemove (overlay was shown),
+                   (b) end-displacement ≥ 100 px,
+                   (c) gesture lasted ≥ 150 ms.
+                   This eliminates trackpad-click drift, which can register a single
+                   batched mousemove of 50+ px even when the user perceives a click. */
                 var dx = e.clientX - startPx.x, dy = e.clientY - startPx.y;
-                var realDrag = (dx * dx + dy * dy) > 400;
+                var dt = Date.now() - startPx.t;
+                var realDrag = isDragging
+                    && (dx * dx + dy * dy) > 10000
+                    && dt > 150;
+
 
                 if (realDrag) {
                     /* Convert BOTH endpoints using the current map state so a
@@ -912,6 +927,7 @@ app.clientside_callback(
                         min_lng: Math.min(sLL.lng, eLL.lng),
                         max_lng: Math.max(sLL.lng, eLL.lng),
                     };
+                    console.log('[JS→ pendingBbox queued]', window._pendingBbox);
                 } else {
                     /* Click: reset only when target is map background, not a feature.
                        Leaflet marks all interactive layers with leaflet-interactive.
@@ -922,7 +938,12 @@ app.clientside_callback(
                         t.classList.contains('leaflet-interactive') ||
                         (t.closest && t.closest('.leaflet-interactive'))
                     );
-                    if (!onFeature) window._pendingReset = true;
+                    if (!onFeature) {
+                        window._pendingReset = true;
+                        console.log('[JS→ pendingReset queued]');
+                    } else {
+                        console.log('[JS→ click on feature, no reset] target=', t && t.tagName, t && t.className);
+                    }
                 }
 
                 startPx = null; isDragging = false;
@@ -936,11 +957,13 @@ app.clientside_callback(
         if (window._pendingBbox) {
             bboxOut = window._pendingBbox;
             window._pendingBbox = null;
+            console.log('[poll→ writing bbox-store]', bboxOut);
         }
         if (window._pendingReset) {
             bboxOut  = null;   /* clear bbox */
             resetOut = null;   /* clear subway selection */
             window._pendingReset = false;
+            console.log('[poll→ writing bbox-store=null, subway-sel=null (reset)]');
         }
         return [bboxOut, resetOut];
     }
