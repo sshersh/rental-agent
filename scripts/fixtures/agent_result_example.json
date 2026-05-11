@@ -1,0 +1,28 @@
+{
+  "Building Address": "282 Skillman Street, Brooklyn, NY 11205",
+  "BBL": "3-01941-0041",
+  "Year built": 2007,
+  "Num Units": 5,
+  "Open HPD Violations": 6,
+  "311 Housing Calls": 1,
+  "Building Class": null,
+  "Num Buildings in Portfolio": 1,
+  "Landlords": [
+    {
+      "Name": "ZALMEN BERKOVITS",
+      "Role": "Individual",
+      "Company": "Zalmen Management",
+      "Phone": "(718) 972-5132",
+      "Address": "3810 14th Ave, Brooklyn, NY 11218; 543 Bedford Ave PMB 215, Brooklyn, NY 11211",
+      "Source": "ZalmenManagement.com, BBB, NYS DOS"
+    },
+    {
+      "Name": "282 SKILLMAN REALTY LLC",
+      "Role": "LLC",
+      "Company": "282 SKILLMAN REALTY LLC",
+      "Phone": null,
+      "Address": "176 Clymer St, Brooklyn, NY 11211; 282 Skillman St, Brooklyn, NY 11205-4887; PO Box 680, Newark, NJ 07101-0680",
+      "Source": "NYS DOS, NYC DOF Property Tax"
+    }
+  ]
+}

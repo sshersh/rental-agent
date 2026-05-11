@@ -1,0 +1,17 @@
+┌──────────────────────┐ localhost
+│  Dash app (8050)     │
+│   poll: GET /api/    │
+│         result/:id   │
+└──────────────────────┘
+            ▲
+            │ HTTPS
+            ▼
+┌──────────────────────┐  Vercel (yourapp.vercel.app)
+│  /api/agent-result   │  ← agent POSTs here
+│  /api/result/:id     │  ← Dash polls here
+│   └─ Vercel KV       │  (or Upstash Redis)
+└──────────────────────┘
+            ▲
+            │ POST callback
+            ▼
+       openclaw agent

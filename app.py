@@ -3,11 +3,13 @@ import os
 import json
 import re
 import smtplib
+import threading
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 
 import pandas as pd
+import requests
 import dash
 from dash import dcc, html, Input, Output, State, callback, ALL, ctx, no_update
 import dash_leaflet as dl
@@ -17,13 +19,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+AGENT_WEBHOOK_URL   = os.getenv("AGENT_WEBHOOK_URL", "").rstrip("/") or None
+CALLBACK_PUBLIC_URL = os.getenv("CALLBACK_PUBLIC_URL", "").rstrip("/") or None
+CALLBACK_LOCAL_URL  = os.getenv("CALLBACK_LOCAL_URL", "http://localhost:9000").rstrip("/")
+SHARED_SECRET       = os.getenv("SHARED_SECRET") or None
+
 # ── Data loading ───────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 
 df = pd.read_csv(BASE_DIR / "bklyn_rent_stabilized_buildings.csv")
-df = df.dropna(subset=["LATITUDE", "LONGITUDE"])
+df = df.dropna(subset=["LATITUDE", "LONGITUDE", "BLOCK", "LOT"])
+df["BLOCK"] = df["BLOCK"].astype(int)
+df["LOT"]   = df["LOT"].astype(int)
 df["id"] = df["BLOCK"].astype(str) + "-" + df["LOT"].astype(str)
 df["address"] = (
     df["BUILDING_NO"].astype(str) + " " + df["STREET"].str.strip() + ", Brooklyn"
@@ -210,7 +219,7 @@ function(feature, layer, context) {
 NAVBAR = dbc.Navbar(
     dbc.Container(
         [
-            dbc.NavbarBrand("Brooklyn Rent Stabilized", className="fw-bold me-3"),
+            dbc.NavbarBrand("House Me", className="fw-bold me-3"),
             html.Span(id="nav-count", className="text-secondary small"),
         ],
         fluid=True,
@@ -241,13 +250,13 @@ SIDEBAR = html.Div(
                 dbc.Switch(
                     id="subway-toggle",
                     label="Subway stops",
-                    value=False,
+                    value=True,
                     className="mb-1 small",
                 ),
                 dbc.Switch(
                     id="zip-toggle",
                     label="ZIP boundaries",
-                    value=False,
+                    value=True,
                     className="mb-1 small",
                 ),
                 html.Div(id="selection-status", className="small text-warning mt-1"),
@@ -278,6 +287,11 @@ SIDEBAR = html.Div(
                     style={"display": "none"},
                 ),
                 html.Div(id="building-count", className="small text-secondary mt-1"),
+                html.Div(
+                    id="selected-list",
+                    className="mt-2",
+                    style={"maxHeight": "260px", "overflowY": "auto"},
+                ),
                 html.Div(
                     className="small text-secondary mt-2",
                     style={"opacity": "0.5", "fontSize": "10px"},
@@ -438,6 +452,81 @@ EMAIL_MODAL = dbc.Modal(
     scrollable=True,
 )
 
+BUILDING_DETAIL_MODAL = dbc.Modal(
+    [
+        dbc.ModalHeader(dbc.ModalTitle(id="building-detail-title")),
+        dbc.ModalBody(
+            [
+                html.Div(id="building-detail-body"),
+                dbc.Button(
+                    "Lookup Owner",
+                    id="modal-lookup-btn",
+                    size="sm",
+                    color="primary",
+                    className="mt-2",
+                    n_clicks=0,
+                    style={"display": "none"},
+                ),
+            ]
+        ),
+    ],
+    id="building-detail-modal",
+    is_open=False,
+    size="md",
+)
+
+TASK_PROGRESS_BAR = html.Div(
+    id="task-progress-bar",
+    style={
+        "position": "fixed",
+        "top": "50px",
+        "left": 0,
+        "right": 0,
+        "zIndex": 1500,
+        "padding": "8px 16px",
+        "background": "rgba(18,18,42,0.97)",
+        "borderBottom": "1px solid #2a2a4a",
+        "display": "none",
+    },
+    children=[
+        html.Div(id="task-progress-label", className="small text-secondary mb-1"),
+        dbc.Progress(
+            id="task-progress-fill",
+            value=0,
+            striped=True,
+            animated=True,
+            style={"height": "8px"},
+        ),
+    ],
+)
+
+LOOKUP_TOAST = dbc.Toast(
+    [
+        html.Div(id="lookup-toast-msg", className="small mb-2"),
+        dbc.Button(
+            "View details →",
+            id="lookup-toast-view-btn",
+            size="sm",
+            color="info",
+            className="w-100",
+            n_clicks=0,
+        ),
+    ],
+    id="lookup-toast",
+    header="Owner details found",
+    icon="success",
+    duration=10000,
+    is_open=False,
+    dismissable=True,
+    style={
+        "position": "fixed",
+        "bottom": 20,
+        "left": 20,
+        "minWidth": 320,
+        "zIndex": 9999,
+    },
+)
+
 # ── App init ───────────────────────────────────────────────────────────────
 app = dash.Dash(
     __name__,
@@ -451,17 +540,114 @@ app.layout = html.Div(
         dcc.Store(id="shortlist-store", storage_type="local"),
         dcc.Store(id="bbox-store", data=None),
         dcc.Store(id="subway-selection-store", data=None),
+        dcc.Store(id="modal-building-id", data=None),
+        dcc.Store(id="lookup-status", storage_type="session", data={}),
+        dcc.Store(id="lookup-toast-store"),
+        dcc.Store(id="task-batch", data={"started": 0, "done": 0}),
         dcc.Interval(id="sel-poll", interval=150, n_intervals=0),
+        dcc.Interval(
+            id="lookup-poll",
+            interval=2000,
+            n_intervals=0,
+            disabled=True,
+        ),
+        dcc.Interval(
+            id="task-cleanup",
+            interval=2000,
+            n_intervals=0,
+            disabled=True,
+        ),
         NAVBAR,
+        TASK_PROGRESS_BAR,
         html.Div(
             [MAP_AREA, SIDEBAR],
             style={"display": "flex", "height": "calc(100vh - 50px)"},
         ),
         EMAIL_MODAL,
+        BUILDING_DETAIL_MODAL,
+        LOOKUP_TOAST,
     ]
 )
 
 # ── Callbacks ──────────────────────────────────────────────────────────────
+
+
+SELECTED_CARD_LIMIT = 200
+
+
+def _bbl_for(props: dict) -> str:
+    try:
+        return f'3-{int(float(props.get("block", ""))):05d}-{int(float(props.get("lot", ""))):04d}'
+    except (ValueError, TypeError):
+        return ""
+
+
+def _lookup_button(bbl: str, status: str):
+    btn_style = {"fontSize": "11px", "padding": "2px 8px"}
+    common = dict(
+        id={"type": "lookup-btn", "id": bbl},
+        size="sm",
+        className="flex-shrink-0",
+        style=btn_style,
+    )
+    if status == "loading":
+        return dbc.Button(
+            [
+                dbc.Spinner(
+                    size="sm",
+                    spinner_style={"width": "0.8rem", "height": "0.8rem"},
+                ),
+                " Searching",
+            ],
+            color="info",
+            outline=True,
+            disabled=True,
+            **common,
+        )
+    if status == "done":
+        return dbc.Button("✓ Found", color="success", disabled=True, **common)
+    return dbc.Button("Lookup", color="primary", outline=True, **common)
+
+
+def _selected_cards(features, lookup_status=None):
+    if not features:
+        return html.P(
+            "No buildings in current selection.",
+            className="small text-secondary mb-0",
+        )
+    status_map = lookup_status or {}
+    cards = []
+    for f in features[:SELECTED_CARD_LIMIT]:
+        props = f["properties"]
+        bbl = _bbl_for(props)
+        st = (status_map.get(bbl) or {}).get("status", "idle")
+        cards.append(
+            html.Div(
+                [
+                    html.Div(
+                        props["address"],
+                        id={"type": "building-card", "id": props["id"]},
+                        n_clicks=0,
+                        className="small text-truncate flex-grow-1",
+                        style={"cursor": "pointer", "minWidth": 0},
+                    ),
+                    _lookup_button(bbl, st),
+                ],
+                className="mb-1 p-2 rounded d-flex align-items-center gap-2",
+                style={
+                    "background": "#1a1a2e",
+                    "border": "1px solid #2a2a4a",
+                },
+            )
+        )
+    if len(features) > SELECTED_CARD_LIMIT:
+        cards.append(
+            html.Div(
+                f"Showing first {SELECTED_CARD_LIMIT:,} of {len(features):,}",
+                className="small text-secondary mt-2",
+            )
+        )
+    return cards
 
 
 @callback(
@@ -495,6 +681,16 @@ def update_buildings(selected_zips, bbox, subway_sel, radius_km):
     total = len(ALL_FEATURES)
     label = f"{n:,} of {total:,} buildings"
     return geojson, label, label
+
+
+@callback(
+    Output("selected-list", "children"),
+    Input("buildings-layer", "data"),
+    Input("lookup-status", "data"),
+)
+def render_selected_list(geojson, lookup_status):
+    features = ((geojson or {}).get("features") or [])
+    return _selected_cards(features, lookup_status)
 
 
 @callback(
@@ -567,6 +763,624 @@ def show_clicked(click_data):
         if geom else EMPTY_GEOJSON
     )
     return panel, highlight
+
+
+# Lookup for fast card-click → building props resolution
+FEATURES_BY_ID  = {f["properties"]["id"]: f["properties"] for f in ALL_FEATURES}
+FEATURES_BY_BBL = {
+    _bbl_for(f["properties"]): f["properties"]
+    for f in ALL_FEATURES
+    if _bbl_for(f["properties"])
+}
+
+
+def _fire_enrichment_webhook(correlation_id: str, props: dict) -> None:
+    """POST a job to the kiloclaw webhook. Fire-and-forget; runs in a thread
+    so the Dash callback returns immediately."""
+    if not AGENT_WEBHOOK_URL or not CALLBACK_PUBLIC_URL or not SHARED_SECRET:
+        return
+    payload = {
+        "correlation_id": correlation_id,
+        "bbl":     _bbl_for(props) or None,
+        "address": props.get("address"),
+        "zip":     props.get("zip"),
+        "block":   props.get("block"),
+        "lot":     props.get("lot"),
+        "callback_url":  f"{CALLBACK_PUBLIC_URL}/agent-result",
+    }
+    try:
+        requests.post(AGENT_WEBHOOK_URL, json=payload, timeout=8)
+    except Exception:
+        pass
+
+
+def _fetch_enrichment_result(building_id: str):
+    """Returns the agent's data dict if ready, None if still pending."""
+    if not SHARED_SECRET:
+        return None
+    try:
+        r = requests.get(
+            f"{CALLBACK_LOCAL_URL}/result/{building_id}",
+            headers={"Authorization": f"Bearer {SHARED_SECRET}"},
+            timeout=4,
+        )
+        if r.status_code != 200:
+            return None
+        body = r.json()
+        if body.get("status") == "ready":
+            return body.get("data")
+    except Exception:
+        return None
+    return None
+
+
+STAT_FIELDS = [
+    ("Year built",               "year_built"),
+    ("Units",                    "num_units"),
+    ("Building class",           "building_class"),
+    ("Buildings in portfolio",   "num_buildings_in_portfolio"),
+    ("Open HPD violations",      "open_hpd_violations"),
+    ("Total HPD violations",     "total_hpd_violations"),
+    ("Last HPD registration",    "last_hpd_registration"),
+    ("Rent stabilized units",    "rent_stabilized_units"),
+    ("Rent stab note",           "rent_stab_note"),
+    ("311 housing calls",        "311_housing_calls"),
+    ("Eviction filings (2017+)", "eviction_filings_since_2017"),
+    ("Evictions executed",       "evictions_executed"),
+    ("Matched building",         "matched_building"),
+]
+
+# Top-level metadata keys the modal already shows in the Building section,
+# plus anything that must never be displayed (echoed-back auth, internal IDs).
+INTERNAL_FIELDS = {
+    "address", "bbl", "block", "lot", "zip",
+    "correlation_id", "building_address", "search_address",
+    "shared_secret",
+}
+
+NAMED_DICT_SECTIONS = [
+    ("Recommended outreach", "recommended_outreach", False),
+    ("Portfolio",            "portfolio",            False),
+    ("Useful links",         "useful_links",         True),
+]
+
+
+def _render_dict_rows(d, as_links=False):
+    rows = []
+    for k, v in d.items():
+        label = k.replace("_", " ").capitalize()
+        if as_links and isinstance(v, str) and v.startswith(("http://", "https://")):
+            content = html.A(v, href=v, target="_blank", className="small")
+        elif isinstance(v, (list, dict)):
+            content = html.Pre(
+                json.dumps(v, indent=2),
+                className="small mb-0",
+                style={"whiteSpace": "pre-wrap"},
+            )
+        else:
+            content = html.Span("—" if v in (None, "") else str(v), className="small")
+        rows.append(
+            html.Div([html.Strong(f"{label}: "), content], className="small mb-1")
+        )
+    return html.Div(rows, className="mb-3 ms-2")
+
+
+def _unwrap_agent_data(stored):
+    """Agent sometimes wraps the payload under a 'result' key. Flatten it."""
+    if isinstance(stored, dict) and isinstance(stored.get("result"), dict):
+        merged = {k: v for k, v in stored.items() if k != "result"}
+        merged.update(stored["result"])
+        return merged
+    return stored or {}
+
+
+def _entity_cards(items):
+    cards = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        name = it.get("name") or "(unnamed)"
+        rows = []
+        for k, v in it.items():
+            if k == "name" or v is None or v == "":
+                continue
+            label = k.replace("_", " ").capitalize()
+            rows.append(
+                html.Div(
+                    [html.Strong(f"{label}: "), html.Span(str(v))],
+                    className="small mb-1",
+                )
+            )
+        cards.append(
+            dbc.Card(
+                dbc.CardBody(
+                    [html.Div(name, className="fw-bold mb-2")] + rows,
+                    style={"padding": "10px"},
+                ),
+                className="mb-2",
+                color="dark",
+            )
+        )
+    return cards
+
+
+def _render_database_section(props: dict, bbl: str):
+    block = str(props.get("block", "")).zfill(5)
+    lot   = str(props.get("lot",   "")).zfill(4)
+    acris = f"https://a836-acris.nyc.gov/DS/DocumentSearch/BBL?ms_bbl=3{block}{lot}"
+    return html.Div(
+        [
+            html.H6(
+                "Building",
+                className="text-uppercase text-secondary small mb-2",
+                style={"letterSpacing": "0.08em"},
+            ),
+            html.Div([html.Strong("BBL: "), bbl or "—"], className="mb-1"),
+            html.Div([html.Strong("ZIP: "), props.get("zip", "")], className="mb-1"),
+            html.Div(
+                [html.Strong("Block / Lot: "),
+                 f"{props.get('block')} / {props.get('lot')}"],
+                className="mb-1",
+            ),
+            html.Div(
+                [html.Strong("Statuses: "), props.get("statuses") or "—"],
+                className="mb-2",
+            ),
+            html.A(
+                "ACRIS lookup ↗",
+                href=acris,
+                target="_blank",
+                className="btn btn-sm btn-outline-info",
+            ),
+        ]
+    )
+
+
+def _render_owner_section(stored):
+    data = _unwrap_agent_data(stored)
+    sections = [
+        html.H6(
+            "Owner / Landlords",
+            className="text-uppercase text-secondary small mb-2",
+            style={"letterSpacing": "0.08em"},
+        ),
+    ]
+
+    stat_rows = [
+        html.Div(
+            [html.Strong(f"{label}: "), html.Span(str(data[key]))],
+            className="mb-1",
+        )
+        for label, key in STAT_FIELDS
+        if key in data and data[key] is not None
+    ]
+    if stat_rows:
+        sections.append(html.Div(stat_rows, className="mb-3"))
+
+    flags = data.get("flags")
+    if isinstance(flags, list) and flags:
+        sections.append(
+            html.Div(
+                [
+                    html.Div(
+                        "Flags",
+                        className="small text-warning fw-bold mb-1",
+                    ),
+                    html.Ul(
+                        [html.Li(str(f), className="small") for f in flags],
+                        className="mb-3 ps-3",
+                    ),
+                ]
+            )
+        )
+
+    landlords = data.get("landlords")
+    if isinstance(landlords, list) and landlords:
+        sections.append(
+            html.Div("Landlords", className="small fw-bold mt-2 mb-1")
+        )
+        sections.extend(_entity_cards(landlords))
+
+    entities = data.get("corporate_entities")
+    if isinstance(entities, list) and entities:
+        sections.append(
+            html.Div("Corporate entities", className="small fw-bold mt-2 mb-1")
+        )
+        sections.extend(_entity_cards(entities))
+
+    for label, key, as_links in NAMED_DICT_SECTIONS:
+        v = data.get(key)
+        if isinstance(v, dict) and v:
+            sections.append(
+                html.Div(label, className="small fw-bold mt-2 mb-1")
+            )
+            sections.append(_render_dict_rows(v, as_links=as_links))
+
+    handled = (
+        {f[1] for f in STAT_FIELDS}
+        | {"flags", "landlords", "corporate_entities"}
+        | {k for _, k, _ in NAMED_DICT_SECTIONS}
+    )
+    remaining = {
+        k: v for k, v in data.items()
+        if k not in INTERNAL_FIELDS and k not in handled and v not in (None, "", [], {})
+    }
+    if remaining:
+        sections.append(html.Hr(className="my-2"))
+        sections.append(html.Div("Other fields", className="small fw-bold mb-1"))
+        sections.append(_render_dict_rows(remaining))
+
+    # Fallback if nothing rendered beyond the header
+    if len(sections) == 1:
+        sections.append(
+            html.Pre(
+                json.dumps(stored, indent=2),
+                className="small mb-0",
+                style={"whiteSpace": "pre-wrap"},
+            )
+        )
+
+    return html.Div(sections)
+
+
+def _render_modal_body(props: dict, bbl: str, lookup_status: dict):
+    entry = (lookup_status or {}).get(bbl) or {}
+    state = entry.get("status", "idle")
+    if state == "done" and entry.get("data"):
+        owner = _render_owner_section(entry["data"])
+    elif state == "loading":
+        owner = html.Div(
+            [
+                html.H6(
+                    "Owner / Landlords",
+                    className="text-uppercase text-secondary small mb-2",
+                    style={"letterSpacing": "0.08em"},
+                ),
+                dbc.Spinner(
+                    html.Div(
+                        "Searching for owner…",
+                        className="small text-secondary",
+                    ),
+                    size="sm",
+                    color="info",
+                ),
+            ]
+        )
+    else:
+        owner = html.Div(
+            [
+                html.H6(
+                    "Owner / Landlords",
+                    className="text-uppercase text-secondary small mb-2",
+                    style={"letterSpacing": "0.08em"},
+                ),
+                html.P(
+                    "Owner details haven't been fetched yet.",
+                    className="small text-secondary mb-0",
+                ),
+            ]
+        )
+    return html.Div(
+        [
+            _render_database_section(props, bbl),
+            html.Hr(),
+            owner,
+        ]
+    )
+
+
+@callback(
+    Output("building-detail-modal", "is_open"),
+    Output("modal-building-id", "data"),
+    Input({"type": "building-card", "id": ALL}, "n_clicks"),
+    Input("lookup-toast-view-btn", "n_clicks"),
+    State("lookup-toast-store", "data"),
+    prevent_initial_call=True,
+)
+def open_modal(card_clicks, toast_clicks, toast_data):
+    trig = ctx.triggered_id
+    if isinstance(trig, dict) and trig.get("type") == "building-card":
+        if not any(n for n in (card_clicks or []) if n):
+            return no_update, no_update
+        return True, trig["id"]
+    if trig == "lookup-toast-view-btn":
+        if not toast_clicks:
+            return no_update, no_update
+        bbl = (toast_data or {}).get("bbl")
+        props = FEATURES_BY_BBL.get(bbl)
+        if not props:
+            return no_update, no_update
+        return True, props["id"]
+    return no_update, no_update
+
+
+@callback(
+    Output("building-detail-title", "children"),
+    Output("building-detail-body", "children"),
+    Output("lookup-status", "data", allow_duplicate=True),
+    Input("modal-building-id", "data"),
+    Input("lookup-status", "data"),
+    prevent_initial_call=True,
+)
+def render_modal(building_id, lookup_status):
+    if not building_id:
+        return no_update, no_update, no_update
+    props = FEATURES_BY_ID.get(building_id)
+    if not props:
+        return "", "(building not found)", no_update
+    bbl = _bbl_for(props)
+    status_map = dict(lookup_status or {})
+    entry = dict(status_map.get(bbl) or {})
+    status_update = no_update
+    # Backfill: status says done but the data wasn't persisted (older sessions).
+    if entry.get("status") == "done" and not entry.get("data"):
+        fetched = _fetch_enrichment_result(bbl)
+        if fetched:
+            entry["data"] = fetched
+            status_map[bbl] = entry
+            status_update = status_map
+    # If we've never run lookup but the server already has a cached result
+    # (e.g. someone else triggered it earlier), surface it on open.
+    elif not entry:
+        fetched = _fetch_enrichment_result(bbl)
+        if fetched:
+            entry = {"status": "done", "address": props.get("address"), "data": fetched}
+            status_map[bbl] = entry
+            status_update = status_map
+    return (
+        props.get("address", ""),
+        _render_modal_body(props, bbl, status_map),
+        status_update,
+    )
+
+
+# ── Per-card "Lookup Owner" flow ──────────────────────────────────────────
+
+
+def _start_lookup_for_bbl(bbl, status, batch):
+    """Common helper: mutates (copies of) status + batch when a new lookup
+    should start for this BBL. Returns (new_status, new_batch) or (None, None)
+    if the lookup shouldn't fire (already loading/done, or unknown BBL)."""
+    if (status.get(bbl) or {}).get("status") in ("loading", "done"):
+        return None, None
+    props = FEATURES_BY_BBL.get(bbl)
+    if not props:
+        return None, None
+    new_status = dict(status)
+    new_status[bbl] = {"status": "loading", "address": props.get("address")}
+    new_batch = dict(batch or {})
+    new_batch["started"] = new_batch.get("started", 0) + 1
+    new_batch.setdefault("done", 0)
+    threading.Thread(
+        target=_fire_enrichment_webhook, args=(bbl, props), daemon=True,
+    ).start()
+    return new_status, new_batch
+
+
+@callback(
+    Output("lookup-status", "data"),
+    Output("task-batch", "data"),
+    Input({"type": "lookup-btn", "id": ALL}, "n_clicks"),
+    State("lookup-status", "data"),
+    State("task-batch", "data"),
+    prevent_initial_call=True,
+)
+def start_lookup(n_clicks_list, status, batch):
+    if not any(n for n in (n_clicks_list or []) if n):
+        return no_update, no_update
+    trig = ctx.triggered_id
+    if not trig or trig.get("type") != "lookup-btn":
+        return no_update, no_update
+    new_status, new_batch = _start_lookup_for_bbl(trig["id"], status or {}, batch or {})
+    if new_status is None:
+        return no_update, no_update
+    return new_status, new_batch
+
+
+@callback(
+    Output("lookup-status", "data", allow_duplicate=True),
+    Output("task-batch", "data", allow_duplicate=True),
+    Input("modal-lookup-btn", "n_clicks"),
+    State("modal-building-id", "data"),
+    State("lookup-status", "data"),
+    State("task-batch", "data"),
+    prevent_initial_call=True,
+)
+def start_lookup_from_modal(n, building_id, status, batch):
+    if not n or not building_id:
+        return no_update, no_update
+    props = FEATURES_BY_ID.get(building_id)
+    if not props:
+        return no_update, no_update
+    bbl = _bbl_for(props)
+    if not bbl:
+        return no_update, no_update
+    new_status, new_batch = _start_lookup_for_bbl(bbl, status or {}, batch or {})
+    if new_status is None:
+        return no_update, no_update
+    return new_status, new_batch
+
+
+@callback(
+    Output("lookup-status", "data", allow_duplicate=True),
+    Output("lookup-toast-store", "data"),
+    Output("task-batch", "data", allow_duplicate=True),
+    Input("lookup-poll", "n_intervals"),
+    State("lookup-status", "data"),
+    State("task-batch", "data"),
+    prevent_initial_call=True,
+)
+def poll_lookups(_n, status, batch):
+    status = dict(status or {})
+    loading = [bbl for bbl, v in status.items() if (v or {}).get("status") == "loading"]
+    if not loading:
+        return no_update, no_update, no_update
+    completed = []  # list of (bbl, address)
+    for bbl in loading:
+        data = _fetch_enrichment_result(bbl)
+        if data is None:
+            continue
+        prev = status.get(bbl) or {}
+        status[bbl] = {
+            "status":  "done",
+            "address": prev.get("address"),
+            "data":    data,
+        }
+        completed.append((bbl, prev.get("address") or bbl))
+    if not completed:
+        return no_update, no_update, no_update
+    new_batch = dict(batch or {})
+    new_batch["done"]    = new_batch.get("done", 0) + len(completed)
+    new_batch.setdefault("started", 0)
+    last_bbl, last_addr = completed[-1]
+    toast = {
+        "bbl":     last_bbl,
+        "address": last_addr,
+        "more":    len(completed) - 1,
+        "tick":    _n,
+    }
+    return status, toast, new_batch
+
+
+@callback(
+    Output("lookup-poll", "disabled"),
+    Input("lookup-status", "data"),
+)
+def manage_lookup_poll(status):
+    has_loading = any(
+        (v or {}).get("status") == "loading" for v in (status or {}).values()
+    )
+    return not has_loading
+
+
+# ── Task progress bar ────────────────────────────────────────────────────
+
+
+_TASK_BAR_HIDDEN_STYLE = {"display": "none"}
+_TASK_BAR_VISIBLE_STYLE = {
+    "position": "fixed", "top": "50px", "left": 0, "right": 0, "zIndex": 1500,
+    "padding": "8px 16px", "background": "rgba(18,18,42,0.97)",
+    "borderBottom": "1px solid #2a2a4a", "display": "block",
+}
+
+
+@callback(
+    Output("task-progress-bar", "style"),
+    Output("task-progress-label", "children"),
+    Output("task-progress-fill", "value"),
+    Input("task-batch", "data"),
+)
+def render_task_progress(batch):
+    started = (batch or {}).get("started", 0)
+    done    = (batch or {}).get("done", 0)
+    if started <= 0:
+        return _TASK_BAR_HIDDEN_STYLE, no_update, no_update
+    pct = int(100 * done / started) if started else 0
+    word = "lookup" if started == 1 else "lookups"
+    label = f"{done} / {started} owner {word} complete"
+    return _TASK_BAR_VISIBLE_STYLE, label, pct
+
+
+@callback(
+    Output("task-cleanup", "disabled"),
+    Input("task-batch", "data"),
+)
+def manage_task_cleanup(batch):
+    started = (batch or {}).get("started", 0)
+    done    = (batch or {}).get("done", 0)
+    # Enable the cleanup interval only after every started task has completed.
+    if started > 0 and done >= started:
+        return False
+    return True
+
+
+@callback(
+    Output("task-batch", "data", allow_duplicate=True),
+    Output("task-cleanup", "disabled", allow_duplicate=True),
+    Input("task-cleanup", "n_intervals"),
+    prevent_initial_call=True,
+)
+def reset_task_batch(_n):
+    return {"started": 0, "done": 0}, True
+
+
+# ── Modal "Lookup Owner" button visibility ───────────────────────────────
+
+
+_MODAL_BTN_HIDDEN  = {"display": "none"}
+_MODAL_BTN_VISIBLE = {"display": "inline-block"}
+
+
+@callback(
+    Output("modal-lookup-btn", "style"),
+    Input("modal-building-id", "data"),
+    Input("lookup-status", "data"),
+)
+def manage_modal_lookup_btn(building_id, lookup_status):
+    if not building_id:
+        return _MODAL_BTN_HIDDEN
+    props = FEATURES_BY_ID.get(building_id)
+    if not props:
+        return _MODAL_BTN_HIDDEN
+    bbl = _bbl_for(props)
+    state = ((lookup_status or {}).get(bbl) or {}).get("status", "idle")
+    return _MODAL_BTN_VISIBLE if state == "idle" else _MODAL_BTN_HIDDEN
+
+
+@callback(
+    Output("lookup-toast", "is_open"),
+    Output("lookup-toast-msg", "children"),
+    Input("lookup-toast-store", "data"),
+    State("lookup-status", "data"),
+    prevent_initial_call=True,
+)
+def show_lookup_toast(payload, lookup_status):
+    if not payload or not payload.get("bbl"):
+        return no_update, no_update
+    bbl  = payload["bbl"]
+    addr = payload.get("address") or bbl
+    more = payload.get("more") or 0
+    data = _unwrap_agent_data(((lookup_status or {}).get(bbl) or {}).get("data"))
+
+    parts = [html.Div(addr, className="small fw-bold mb-1")]
+
+    counts = []
+    nl = len(data.get("landlords") or [])
+    nc = len(data.get("corporate_entities") or [])
+    if nl:
+        counts.append(f"{nl} landlord{'s' if nl != 1 else ''}")
+    if nc:
+        counts.append(f"{nc} corp entit{'ies' if nc != 1 else 'y'}")
+    if counts:
+        parts.append(
+            html.Div(" · ".join(counts), className="small text-secondary mb-1")
+        )
+
+    top_landlord = ((data.get("landlords") or [{}])[0] or {}).get("name")
+    if top_landlord:
+        parts.append(
+            html.Div(top_landlord, className="small fst-italic mb-1")
+        )
+
+    flags = data.get("flags") or []
+    if flags:
+        parts.append(
+            html.Div(
+                f"⚠ {flags[0]}",
+                className="small text-warning mb-1",
+                style={"whiteSpace": "normal"},
+            )
+        )
+
+    if more:
+        parts.append(
+            html.Div(
+                f"+{more} more building{'s' if more != 1 else ''}",
+                className="small text-secondary mt-2",
+            )
+        )
+
+    return True, html.Div(parts)
 
 
 @callback(
