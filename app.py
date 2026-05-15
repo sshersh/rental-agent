@@ -4,6 +4,7 @@ import json
 import re
 import smtplib
 import threading
+import time
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from pathlib import Path
@@ -23,6 +24,9 @@ AGENT_WEBHOOK_URL   = os.getenv("AGENT_WEBHOOK_URL", "").rstrip("/") or None
 CALLBACK_PUBLIC_URL = os.getenv("CALLBACK_PUBLIC_URL", "").rstrip("/") or None
 CALLBACK_LOCAL_URL  = os.getenv("CALLBACK_LOCAL_URL", "http://localhost:9000").rstrip("/")
 SHARED_SECRET       = os.getenv("SHARED_SECRET") or None
+
+LOOKUP_TIMEOUT_SECONDS = 90    # 90-second per-request budget before we move on
+_LOOKUP_ERRORS: dict = {}      # bbl -> True; written by webhook thread on request failure
 
 # ── Data loading ───────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
@@ -219,10 +223,21 @@ function(feature, layer, context) {
 NAVBAR = dbc.Navbar(
     dbc.Container(
         [
-            dbc.NavbarBrand("House Me", className="fw-bold me-3"),
-            html.Span(id="nav-count", className="text-secondary small"),
+            dbc.NavbarBrand("House Me Daddy", className="fw-bold me-3"),
+            html.Span(id="nav-count", className="text-secondary small me-auto"),
+            dbc.Button(
+                "⚙",
+                id="settings-btn",
+                color="secondary",
+                outline=True,
+                size="sm",
+                n_clicks=0,
+                className="ms-2",
+                style={"fontSize": "15px", "lineHeight": "1", "padding": "2px 10px"},
+            ),
         ],
         fluid=True,
+        className="d-flex align-items-center",
     ),
     dark=True,
     color="dark",
@@ -232,87 +247,77 @@ NAVBAR = dbc.Navbar(
 
 SIDEBAR = html.Div(
     [
-        html.Div(
-            [
-                html.Div(
-                    "Filters",
-                    className="text-uppercase text-secondary fw-bold small mb-2",
-                    style={"letterSpacing": "0.08em"},
-                ),
-                dcc.Dropdown(
-                    id="zip-filter",
-                    options=[{"label": z, "value": z} for z in ALL_ZIPS],
-                    multi=True,
-                    placeholder="Filter by ZIP code…",
-                    style={"fontSize": "13px"},
-                    className="mb-2",
-                ),
-                dbc.Switch(
-                    id="subway-toggle",
-                    label="Subway stops",
-                    value=True,
-                    className="mb-1 small",
-                ),
-                dbc.Switch(
-                    id="zip-toggle",
-                    label="ZIP boundaries",
-                    value=True,
-                    className="mb-1 small",
-                ),
-                html.Div(id="selection-status", className="small text-warning mt-1"),
-                html.Div(
-                    id="radius-control",
-                    children=[
-                        html.Hr(className="my-2"),
-                        html.Div(id="radius-label", className="small text-info mb-1"),
-                        dcc.Slider(
-                            id="radius-slider",
-                            min=0.25,
-                            max=2.0,
-                            step=0.25,
-                            value=0.5,
-                            marks={0.25: "0.25", 0.5: "0.5", 1.0: "1", 2.0: "2"},
-                            tooltip={"placement": "bottom", "always_visible": False},
-                        ),
-                        html.Div("km radius", className="small text-secondary text-center"),
-                        dbc.Button(
-                            "Clear selection",
-                            id="clear-selection-btn",
-                            size="sm",
-                            color="warning",
-                            outline=True,
-                            className="w-100 mt-1",
-                        ),
-                    ],
-                    style={"display": "none"},
-                ),
-                html.Div(id="building-count", className="small text-secondary mt-1"),
-                html.Div(
-                    id="selected-list",
-                    className="mt-2",
-                    style={"maxHeight": "260px", "overflowY": "auto"},
-                ),
-                html.Div(
-                    className="small text-secondary mt-2",
-                    style={"opacity": "0.5", "fontSize": "10px"},
-                    children="Drag to select area · Click stop for radius · Click map to reset",
-                ),
-            ],
-            className="p-3 border-bottom border-secondary",
-        ),
-        html.Div(
-            id="clicked-panel",
-            className="p-3 border-bottom border-secondary",
-            children=html.P(
-                "Click a building for details",
-                className="small text-secondary mb-0",
-            ),
-        ),
+        # ── Selected buildings ─────────────────────────────────────────
         html.Div(
             [
                 html.Div(
                     [
-                        html.Span("Shortlist", className="fw-bold small"),
+                        html.Span("Selected", className="fw-bold small"),
+                        html.Span(
+                            id="selected-count",
+                            className="badge bg-warning text-dark rounded-pill ms-2",
+                            style={"fontSize": "10px"},
+                        ),
+                        html.Span(
+                            id="selection-status",
+                            className="text-secondary small ms-2",
+                            style={"fontSize": "10px"},
+                        ),
+                    ],
+                    className="d-flex align-items-center mb-2",
+                ),
+                html.Div(
+                    [
+                        dbc.Button(
+                            "Lookup all",
+                            id="bulk-lookup-btn",
+                            size="sm",
+                            color="primary",
+                            outline=True,
+                            className="flex-fill",
+                            style={"fontSize": "11px"},
+                        ),
+                        dbc.Button(
+                            "+ Shortlist",
+                            id="bulk-shortlist-btn",
+                            size="sm",
+                            color="success",
+                            outline=True,
+                            className="flex-fill",
+                            style={"fontSize": "11px"},
+                        ),
+                        dbc.Button(
+                            "Clear",
+                            id="clear-selection-btn",
+                            size="sm",
+                            color="warning",
+                            outline=True,
+                            className="flex-fill",
+                            style={"fontSize": "11px"},
+                        ),
+                    ],
+                    id="bulk-actions",
+                    className="d-flex gap-1 mb-2",
+                    style={"display": "none"},
+                ),
+                html.Div(
+                    id="selected-list",
+                    style={"maxHeight": "300px", "overflowY": "auto"},
+                ),
+                html.Div(
+                    className="small text-secondary mt-2",
+                    style={"opacity": "0.5", "fontSize": "10px"},
+                    children="Drag area · Click stop+radius · Click marker to add/remove",
+                ),
+            ],
+            className="p-3 border-bottom border-secondary",
+        ),
+        # ── Shortlisted owners ────────────────────────────────────────
+        html.Div(
+            [
+                html.Div(
+                    [
+                        html.Span("Shortlisted owners", className="fw-bold small"),
                         html.Span(
                             id="shortlist-count",
                             className="badge bg-primary rounded-pill ms-2",
@@ -323,7 +328,7 @@ SIDEBAR = html.Div(
                 ),
                 html.Div(
                     id="shortlist-items",
-                    children=html.P("None saved yet.", className="small text-secondary"),
+                    children=html.P("No owners yet.", className="small text-secondary"),
                 ),
                 dbc.Button(
                     "Compose Email →",
@@ -334,13 +339,43 @@ SIDEBAR = html.Div(
                     className="w-100 mt-2",
                 ),
             ],
+            className="p-3 border-bottom border-secondary",
+        ),
+        # ── Discovered owners (all past lookups) ──────────────────────
+        html.Div(
+            [
+                html.Div(
+                    [
+                        html.Span("Discovered owners", className="fw-bold small"),
+                        html.Span(
+                            id="all-owners-count",
+                            className="badge bg-secondary rounded-pill ms-2",
+                            style={"fontSize": "10px"},
+                        ),
+                        dbc.Button(
+                            "Show all",
+                            id="all-owners-toggle-btn",
+                            size="sm",
+                            color="link",
+                            n_clicks=0,
+                            className="ms-auto p-0",
+                            style={"fontSize": "10px", "display": "none"},
+                        ),
+                    ],
+                    className="d-flex align-items-center mb-2",
+                ),
+                html.Div(
+                    id="all-owners-items",
+                    children=html.P("No lookups yet.", className="small text-secondary"),
+                ),
+            ],
             className="p-3",
         ),
     ],
     style={
         "width": "280px",
         "flexShrink": "0",
-        "height": "calc(100vh - 50px)",
+        "height": "100%",
         "overflowY": "auto",
         "background": "#12122a",
         "borderLeft": "1px solid #222",
@@ -352,7 +387,7 @@ MAP_AREA = dl.Map(
     center=[40.6501, -73.9496],
     zoom=12,
     scrollWheelZoom=False,
-    style={"height": "calc(100vh - 50px)", "flex": "1"},
+    style={"height": "100%", "flex": "1"},
     children=[
         dl.TileLayer(
             url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png",
@@ -401,13 +436,15 @@ EMAIL_MODAL = dbc.Modal(
                 html.P(
                     [
                         "Template variables: ",
+                        html.Code("{owner_name}"),
+                        ", ",
                         html.Code("{address}"),
                         ", ",
+                        html.Code("{addresses}"),
+                        ", ",
+                        html.Code("{building_count}"),
+                        ", ",
                         html.Code("{zip}"),
-                        ", ",
-                        html.Code("{block}"),
-                        ", ",
-                        html.Code("{lot}"),
                         ", ",
                         html.Code("{sender_email}"),
                     ],
@@ -416,10 +453,11 @@ EMAIL_MODAL = dbc.Modal(
                 dcc.Textarea(
                     id="email-template",
                     value=(
-                        "Hi,\n\n"
+                        "Hi {owner_name},\n\n"
                         "I'm looking for a rent-stabilized apartment and came across "
-                        "your building at {address} (ZIP {zip}).\n\n"
-                        "Is anything currently available, or could you let me know "
+                        "your building at {address}.\n\n"
+                        "Is anything currently available across your {building_count} "
+                        "property/properties ({addresses}), or could you let me know "
                         "when something opens up?\n\n"
                         "Feel free to reply to {sender_email}.\n\n"
                         "Thank you,"
@@ -458,14 +496,27 @@ BUILDING_DETAIL_MODAL = dbc.Modal(
         dbc.ModalBody(
             [
                 html.Div(id="building-detail-body"),
-                dbc.Button(
-                    "Lookup Owner",
-                    id="modal-lookup-btn",
-                    size="sm",
-                    color="primary",
-                    className="mt-2",
-                    n_clicks=0,
-                    style={"display": "none"},
+                html.Div(
+                    [
+                        dbc.Button(
+                            "Lookup Owner",
+                            id="modal-lookup-btn",
+                            size="sm",
+                            color="primary",
+                            n_clicks=0,
+                            style={"display": "none"},
+                        ),
+                        dbc.Button(
+                            "+ Add to shortlist",
+                            id="modal-shortlist-btn",
+                            size="sm",
+                            color="success",
+                            outline=True,
+                            n_clicks=0,
+                            style={"display": "none"},
+                        ),
+                    ],
+                    className="d-flex gap-2 mt-2",
                 ),
             ]
         ),
@@ -478,18 +529,33 @@ BUILDING_DETAIL_MODAL = dbc.Modal(
 TASK_PROGRESS_BAR = html.Div(
     id="task-progress-bar",
     style={
-        "position": "fixed",
-        "top": "50px",
-        "left": 0,
-        "right": 0,
-        "zIndex": 1500,
+        "width": "100%",
         "padding": "8px 16px",
         "background": "rgba(18,18,42,0.97)",
         "borderBottom": "1px solid #2a2a4a",
         "display": "none",
+        "flexShrink": "0",
     },
     children=[
-        html.Div(id="task-progress-label", className="small text-secondary mb-1"),
+        html.Div(
+            [
+                html.Div(id="task-progress-label", className="small text-secondary"),
+                dbc.Button(
+                    "Cancel queued",
+                    id="cancel-queue-btn",
+                    size="sm",
+                    color="danger",
+                    outline=True,
+                    n_clicks=0,
+                    style={
+                        "fontSize": "10px",
+                        "padding": "1px 8px",
+                        "display": "none",
+                    },
+                ),
+            ],
+            className="d-flex justify-content-between align-items-center mb-1",
+        ),
         dbc.Progress(
             id="task-progress-fill",
             value=0,
@@ -527,6 +593,63 @@ LOOKUP_TOAST = dbc.Toast(
     },
 )
 
+SETTINGS_MODAL = dbc.Modal(
+    [
+        dbc.ModalHeader(dbc.ModalTitle("Settings")),
+        dbc.ModalBody(
+            [
+                html.Div(
+                    "Map filters",
+                    className="text-uppercase text-secondary fw-bold small mb-2",
+                    style={"letterSpacing": "0.08em"},
+                ),
+                dcc.Dropdown(
+                    id="zip-filter",
+                    options=[{"label": z, "value": z} for z in ALL_ZIPS],
+                    multi=True,
+                    placeholder="Filter by ZIP code…",
+                    style={"fontSize": "13px"},
+                    className="mb-2",
+                ),
+                html.Div(id="building-count", className="small text-secondary mb-3"),
+                dbc.Switch(
+                    id="subway-toggle",
+                    label="Subway stops",
+                    value=True,
+                    className="mb-1 small",
+                ),
+                dbc.Switch(
+                    id="zip-toggle",
+                    label="ZIP boundaries",
+                    value=False,
+                    className="mb-1 small",
+                ),
+                html.Div(
+                    id="radius-control",
+                    children=[
+                        html.Hr(className="my-2"),
+                        html.Div(id="radius-label", className="small text-info mb-1"),
+                        dcc.Slider(
+                            id="radius-slider",
+                            min=0.25,
+                            max=2.0,
+                            step=0.25,
+                            value=0.5,
+                            marks={0.25: "0.25", 0.5: "0.5", 1.0: "1", 2.0: "2"},
+                            tooltip={"placement": "bottom", "always_visible": False},
+                        ),
+                        html.Div("km radius", className="small text-secondary text-center"),
+                    ],
+                    style={"display": "none"},
+                ),
+            ]
+        ),
+    ],
+    id="settings-modal",
+    is_open=False,
+    size="md",
+)
+
 # ── App init ───────────────────────────────────────────────────────────────
 app = dash.Dash(
     __name__,
@@ -536,7 +659,8 @@ app = dash.Dash(
 )
 
 app.layout = html.Div(
-    [
+    style={"display": "flex", "flexDirection": "column", "height": "100vh", "overflow": "hidden"},
+    children=[
         dcc.Store(id="shortlist-store", storage_type="local"),
         dcc.Store(id="bbox-store", data=None),
         dcc.Store(id="subway-selection-store", data=None),
@@ -544,6 +668,9 @@ app.layout = html.Div(
         dcc.Store(id="lookup-status", storage_type="session", data={}),
         dcc.Store(id="lookup-toast-store"),
         dcc.Store(id="task-batch", data={"started": 0, "done": 0}),
+        dcc.Store(id="selected-buildings", storage_type="session", data=[]),
+        dcc.Store(id="lookup-queue", data=[]),
+        dcc.Store(id="all-owners-expanded", data=False),
         dcc.Interval(id="sel-poll", interval=150, n_intervals=0),
         dcc.Interval(
             id="lookup-poll",
@@ -561,10 +688,11 @@ app.layout = html.Div(
         TASK_PROGRESS_BAR,
         html.Div(
             [MAP_AREA, SIDEBAR],
-            style={"display": "flex", "height": "calc(100vh - 50px)"},
+            style={"display": "flex", "flex": "1", "minHeight": "0", "overflow": "hidden"},
         ),
         EMAIL_MODAL,
         BUILDING_DETAIL_MODAL,
+        SETTINGS_MODAL,
         LOOKUP_TOAST,
     ]
 )
@@ -590,6 +718,10 @@ def _lookup_button(bbl: str, status: str):
         className="flex-shrink-0",
         style=btn_style,
     )
+    if status == "queued":
+        return dbc.Button(
+            "Queued", color="secondary", outline=True, disabled=True, **common,
+        )
     if status == "loading":
         return dbc.Button(
             [
@@ -606,19 +738,24 @@ def _lookup_button(bbl: str, status: str):
         )
     if status == "done":
         return dbc.Button("✓ Found", color="success", disabled=True, **common)
+    if status == "timeout":
+        # Clickable so user can re-queue.
+        return dbc.Button("⚠ Retry", color="warning", **common)
     return dbc.Button("Lookup", color="primary", outline=True, **common)
 
 
-def _selected_cards(features, lookup_status=None):
-    if not features:
+def _selected_cards(building_ids, lookup_status=None):
+    if not building_ids:
         return html.P(
-            "No buildings in current selection.",
+            "Nothing selected. Drag the map or click a building marker.",
             className="small text-secondary mb-0",
         )
     status_map = lookup_status or {}
     cards = []
-    for f in features[:SELECTED_CARD_LIMIT]:
-        props = f["properties"]
+    for bid in building_ids[:SELECTED_CARD_LIMIT]:
+        props = FEATURES_BY_ID.get(bid)
+        if not props:
+            continue
         bbl = _bbl_for(props)
         st = (status_map.get(bbl) or {}).get("status", "idle")
         cards.append(
@@ -632,6 +769,14 @@ def _selected_cards(features, lookup_status=None):
                         style={"cursor": "pointer", "minWidth": 0},
                     ),
                     _lookup_button(bbl, st),
+                    dbc.Button(
+                        "×",
+                        id={"type": "deselect-btn", "id": props["id"]},
+                        size="sm",
+                        color="danger",
+                        outline=True,
+                        style={"fontSize": "10px", "padding": "1px 6px", "flexShrink": "0"},
+                    ),
                 ],
                 className="mb-1 p-2 rounded d-flex align-items-center gap-2",
                 style={
@@ -640,10 +785,10 @@ def _selected_cards(features, lookup_status=None):
                 },
             )
         )
-    if len(features) > SELECTED_CARD_LIMIT:
+    if len(building_ids) > SELECTED_CARD_LIMIT:
         cards.append(
             html.Div(
-                f"Showing first {SELECTED_CARD_LIMIT:,} of {len(features):,}",
+                f"Showing first {SELECTED_CARD_LIMIT:,} of {len(building_ids):,}",
                 className="small text-secondary mt-2",
             )
         )
@@ -655,28 +800,16 @@ def _selected_cards(features, lookup_status=None):
     Output("building-count", "children"),
     Output("nav-count", "children"),
     Input("zip-filter", "value"),
-    Input("bbox-store", "data"),
-    Input("subway-selection-store", "data"),
-    Input("radius-slider", "value"),
+    Input("selected-buildings", "data"),
 )
-def update_buildings(selected_zips, bbox, subway_sel, radius_km):
-    geojson = filter_geojson(selected_zips, bbox)
-    if subway_sel:
-        lat0 = subway_sel["lat"]
-        lng0 = subway_sel["lng"]
-        r_m = (radius_km or 0.5) * 1000
-        m_lat = 111320.0
-        m_lng = 111320.0 * math.cos(math.radians(lat0))
-        geojson = {
-            "type": "FeatureCollection",
-            "features": [
-                f for f in geojson["features"]
-                if math.sqrt(
-                    ((f["geometry"]["coordinates"][1] - lat0) * m_lat) ** 2
-                    + ((f["geometry"]["coordinates"][0] - lng0) * m_lng) ** 2
-                ) <= r_m
-            ],
-        }
+def update_buildings(selected_zips, selected_ids):
+    # While a selection is active, hide all the unselected red markers/clusters
+    # so only the highlighted ones (selected-building-layer) remain on the map.
+    if selected_ids:
+        n = len(selected_ids)
+        label = f"{n:,} selected"
+        return EMPTY_GEOJSON, label, label
+    geojson = filter_geojson(selected_zips)
     n = len(geojson["features"])
     total = len(ALL_FEATURES)
     label = f"{n:,} of {total:,} buildings"
@@ -685,12 +818,19 @@ def update_buildings(selected_zips, bbox, subway_sel, radius_km):
 
 @callback(
     Output("selected-list", "children"),
-    Input("buildings-layer", "data"),
+    Output("selected-count", "children"),
+    Output("bulk-actions", "style"),
+    Input("selected-buildings", "data"),
     Input("lookup-status", "data"),
 )
-def render_selected_list(geojson, lookup_status):
-    features = ((geojson or {}).get("features") or [])
-    return _selected_cards(features, lookup_status)
+def render_selected_list(selected_ids, lookup_status):
+    selected_ids = selected_ids or []
+    cards = _selected_cards(selected_ids, lookup_status)
+    count_label = str(len(selected_ids)) if selected_ids else ""
+    actions_style = (
+        {"display": "flex"} if selected_ids else {"display": "none"}
+    )
+    return cards, count_label, actions_style
 
 
 @callback(
@@ -712,59 +852,6 @@ def toggle_zip(show):
     return ZIP_GEOJSON if show else EMPTY_GEOJSON
 
 
-@callback(
-    Output("clicked-panel", "children"),
-    Output("selected-building-layer", "data"),
-    Input("buildings-layer", "clickData"),
-)
-def show_clicked(click_data):
-    empty_panel = html.P(
-        "Click a building for details", className="small text-secondary mb-0"
-    )
-    if not click_data or "properties" not in click_data:
-        return empty_panel, EMPTY_GEOJSON
-    p = click_data.get("properties", {})
-    if not p.get("id"):
-        return empty_panel, EMPTY_GEOJSON
-    block = str(p.get("block", "")).zfill(5)
-    lot   = str(p.get("lot",   "")).zfill(4)
-    acris = f"https://a836-acris.nyc.gov/DS/DocumentSearch/BBL?ms_bbl=3{block}{lot}"
-    panel = html.Div(
-        [
-            html.Strong(p.get("address"), className="d-block small"),
-            html.Small(
-                f"ZIP {p.get('zip')} · Block {p.get('block')} · Lot {p.get('lot')}",
-                className="text-secondary d-block",
-            ),
-            html.Small(p.get("statuses", ""), className="text-secondary d-block"),
-            html.Div(
-                [
-                    dbc.Button(
-                        "+ Add to shortlist",
-                        id="add-btn",
-                        size="sm",
-                        color="primary",
-                        className="me-2 mt-2",
-                    ),
-                    html.A(
-                        "ACRIS →",
-                        href=acris,
-                        target="_blank",
-                        className="btn btn-outline-secondary btn-sm mt-2",
-                    ),
-                ]
-            ),
-        ]
-    )
-    geom = click_data.get("geometry")
-    highlight = (
-        {"type": "FeatureCollection",
-         "features": [{"type": "Feature", "geometry": geom, "properties": p}]}
-        if geom else EMPTY_GEOJSON
-    )
-    return panel, highlight
-
-
 # Lookup for fast card-click → building props resolution
 FEATURES_BY_ID  = {f["properties"]["id"]: f["properties"] for f in ALL_FEATURES}
 FEATURES_BY_BBL = {
@@ -772,6 +859,89 @@ FEATURES_BY_BBL = {
     for f in ALL_FEATURES
     if _bbl_for(f["properties"])
 }
+
+
+def _building_ids_in_bbox(bbox):
+    if not bbox:
+        return []
+    return [
+        f["properties"]["id"]
+        for f in ALL_FEATURES
+        if (
+            bbox["min_lat"] <= f["geometry"]["coordinates"][1] <= bbox["max_lat"]
+            and bbox["min_lng"] <= f["geometry"]["coordinates"][0] <= bbox["max_lng"]
+        )
+    ]
+
+
+def _building_ids_in_radius(lat0, lng0, radius_km):
+    r_m = (radius_km or 0.5) * 1000
+    m_lat = 111320.0
+    m_lng = 111320.0 * math.cos(math.radians(lat0))
+    out = []
+    for f in ALL_FEATURES:
+        lng, lat = f["geometry"]["coordinates"]
+        if math.sqrt(((lat - lat0) * m_lat) ** 2 + ((lng - lng0) * m_lng) ** 2) <= r_m:
+            out.append(f["properties"]["id"])
+    return out
+
+
+def _primary_landlord(building_data):
+    """Pick the first non-empty landlord dict from an unwrapped agent payload."""
+    if not isinstance(building_data, dict):
+        return None
+    landlords = (building_data.get("landlords") or [])
+    for ll in landlords:
+        if isinstance(ll, dict) and ll.get("name"):
+            return ll
+    # Fallback to first corporate entity if no human landlord found
+    for ent in (building_data.get("corporate_entities") or []):
+        if isinstance(ent, dict) and ent.get("name"):
+            return ent
+    return None
+
+
+def _owner_key(name):
+    return (name or "").strip().casefold()
+
+
+def _group_owners_from_buildings(building_ids, lookup_status):
+    """Walk building_ids → for each looked-up building, take the primary
+    landlord → group into {owner_key: {name, phone, email, office, role,
+    buildings: [{bbl, address}, ...]}}. Returns a list sorted by name."""
+    grouped = {}
+    for bid in building_ids:
+        props = FEATURES_BY_ID.get(bid)
+        if not props:
+            continue
+        bbl = _bbl_for(props)
+        entry = (lookup_status or {}).get(bbl) or {}
+        if entry.get("status") != "done" or not entry.get("data"):
+            continue
+        unwrapped = _unwrap_agent_data(entry["data"])
+        owner = _primary_landlord(unwrapped)
+        if not owner:
+            continue
+        key = _owner_key(owner.get("name"))
+        if key not in grouped:
+            grouped[key] = {
+                "owner_key": key,
+                "name":      owner.get("name"),
+                "phone":     owner.get("phone"),
+                "email":     owner.get("email") or owner.get("email_inferred"),
+                "office":    owner.get("office") or owner.get("company"),
+                "role":      owner.get("role"),
+                "buildings": [],
+            }
+        if not any(b["bbl"] == bbl for b in grouped[key]["buildings"]):
+            grouped[key]["buildings"].append({
+                "bbl":     bbl,
+                "address": props.get("address"),
+                "zip":     props.get("zip"),
+                "block":   props.get("block"),
+                "lot":     props.get("lot"),
+            })
+    return sorted(grouped.values(), key=lambda o: (o.get("name") or "").lower())
 
 
 def _fire_enrichment_webhook(correlation_id: str, props: dict) -> None:
@@ -787,11 +957,12 @@ def _fire_enrichment_webhook(correlation_id: str, props: dict) -> None:
         "block":   props.get("block"),
         "lot":     props.get("lot"),
         "callback_url":  f"{CALLBACK_PUBLIC_URL}/agent-result",
+        "shared_secret": SHARED_SECRET,
     }
     try:
-        requests.post(AGENT_WEBHOOK_URL, json=payload, timeout=8)
+        requests.post(f"{AGENT_WEBHOOK_URL}", json=payload, timeout=8)
     except Exception:
-        pass
+        _LOOKUP_ERRORS[correlation_id] = True
 
 
 def _fetch_enrichment_result(building_id: str):
@@ -1137,109 +1308,142 @@ def render_modal(building_id, lookup_status):
 # ── Per-card "Lookup Owner" flow ──────────────────────────────────────────
 
 
-def _start_lookup_for_bbl(bbl, status, batch):
-    """Common helper: mutates (copies of) status + batch when a new lookup
-    should start for this BBL. Returns (new_status, new_batch) or (None, None)
-    if the lookup shouldn't fire (already loading/done, or unknown BBL)."""
-    if (status.get(bbl) or {}).get("status") in ("loading", "done"):
-        return None, None
+def _queue_lookup_for_bbl(bbl, status, batch, queue):
+    """Common helper: enqueues a BBL for lookup. Returns
+    (new_status, new_batch, new_queue) or (None, None, None) if it shouldn't
+    enqueue (already queued/loading/done, or unknown BBL). The actual webhook
+    fires later in process_lookup_queue when the worker is idle."""
+    if (status.get(bbl) or {}).get("status") in ("queued", "loading", "done"):
+        return None, None, None
     props = FEATURES_BY_BBL.get(bbl)
     if not props:
-        return None, None
+        return None, None, None
     new_status = dict(status)
-    new_status[bbl] = {"status": "loading", "address": props.get("address")}
+    new_status[bbl] = {"status": "queued", "address": props.get("address")}
     new_batch = dict(batch or {})
     new_batch["started"] = new_batch.get("started", 0) + 1
     new_batch.setdefault("done", 0)
-    threading.Thread(
-        target=_fire_enrichment_webhook, args=(bbl, props), daemon=True,
-    ).start()
-    return new_status, new_batch
+    new_queue = list(queue or [])
+    if bbl not in new_queue:
+        new_queue.append(bbl)
+    return new_status, new_batch, new_queue
 
 
 @callback(
     Output("lookup-status", "data"),
     Output("task-batch", "data"),
+    Output("lookup-queue", "data"),
     Input({"type": "lookup-btn", "id": ALL}, "n_clicks"),
     State("lookup-status", "data"),
     State("task-batch", "data"),
+    State("lookup-queue", "data"),
     prevent_initial_call=True,
 )
-def start_lookup(n_clicks_list, status, batch):
+def start_lookup(n_clicks_list, status, batch, queue):
     if not any(n for n in (n_clicks_list or []) if n):
-        return no_update, no_update
+        return no_update, no_update, no_update
     trig = ctx.triggered_id
     if not trig or trig.get("type") != "lookup-btn":
-        return no_update, no_update
-    new_status, new_batch = _start_lookup_for_bbl(trig["id"], status or {}, batch or {})
+        return no_update, no_update, no_update
+    new_status, new_batch, new_queue = _queue_lookup_for_bbl(
+        trig["id"], status or {}, batch or {}, queue or []
+    )
     if new_status is None:
-        return no_update, no_update
-    return new_status, new_batch
+        return no_update, no_update, no_update
+    return new_status, new_batch, new_queue
 
 
 @callback(
     Output("lookup-status", "data", allow_duplicate=True),
     Output("task-batch", "data", allow_duplicate=True),
+    Output("lookup-queue", "data", allow_duplicate=True),
     Input("modal-lookup-btn", "n_clicks"),
     State("modal-building-id", "data"),
     State("lookup-status", "data"),
     State("task-batch", "data"),
+    State("lookup-queue", "data"),
     prevent_initial_call=True,
 )
-def start_lookup_from_modal(n, building_id, status, batch):
+def start_lookup_from_modal(n, building_id, status, batch, queue):
     if not n or not building_id:
-        return no_update, no_update
+        return no_update, no_update, no_update
     props = FEATURES_BY_ID.get(building_id)
     if not props:
-        return no_update, no_update
+        return no_update, no_update, no_update
     bbl = _bbl_for(props)
     if not bbl:
-        return no_update, no_update
-    new_status, new_batch = _start_lookup_for_bbl(bbl, status or {}, batch or {})
+        return no_update, no_update, no_update
+    new_status, new_batch, new_queue = _queue_lookup_for_bbl(
+        bbl, status or {}, batch or {}, queue or []
+    )
     if new_status is None:
-        return no_update, no_update
-    return new_status, new_batch
+        return no_update, no_update, no_update
+    return new_status, new_batch, new_queue
 
 
 @callback(
     Output("lookup-status", "data", allow_duplicate=True),
-    Output("lookup-toast-store", "data"),
+    Output("lookup-toast-store", "data", allow_duplicate=True),
     Output("task-batch", "data", allow_duplicate=True),
+    Output("lookup-queue", "data", allow_duplicate=True),
     Input("lookup-poll", "n_intervals"),
     State("lookup-status", "data"),
     State("task-batch", "data"),
+    State("lookup-queue", "data"),
     prevent_initial_call=True,
 )
-def poll_lookups(_n, status, batch):
+def poll_lookups(_n, status, batch, queue):
     status = dict(status or {})
-    loading = [bbl for bbl, v in status.items() if (v or {}).get("status") == "loading"]
+    loading = [
+        (bbl, v) for bbl, v in status.items() if (v or {}).get("status") == "loading"
+    ]
     if not loading:
-        return no_update, no_update, no_update
-    completed = []  # list of (bbl, address)
-    for bbl in loading:
-        data = _fetch_enrichment_result(bbl)
-        if data is None:
+        return no_update, no_update, no_update, no_update
+    completed = []
+    failed = []   # (bbl, address, reason) — "timeout" or "error"
+    now = time.time()
+    for bbl, v in loading:
+        if _LOOKUP_ERRORS.pop(bbl, None):
+            status[bbl] = {"status": "timeout", "address": v.get("address")}
+            failed.append((bbl, v.get("address") or bbl, "error"))
             continue
-        prev = status.get(bbl) or {}
-        status[bbl] = {
-            "status":  "done",
-            "address": prev.get("address"),
-            "data":    data,
-        }
-        completed.append((bbl, prev.get("address") or bbl))
-    if not completed:
-        return no_update, no_update, no_update
+        data = _fetch_enrichment_result(bbl)
+        if data is not None:
+            status[bbl] = {"status": "done", "address": v.get("address"), "data": data}
+            completed.append((bbl, v.get("address") or bbl))
+            continue
+        started_at = v.get("started_at") or now
+        if now - started_at > LOOKUP_TIMEOUT_SECONDS:
+            status[bbl] = {"status": "timeout", "address": v.get("address"), "started_at": started_at}
+            failed.append((bbl, v.get("address") or bbl, "timeout"))
+    if not completed and not failed:
+        return no_update, no_update, no_update, no_update
     new_batch = dict(batch or {})
-    new_batch["done"]    = new_batch.get("done", 0) + len(completed)
+    new_batch["done"] = new_batch.get("done", 0) + len(completed) + len(failed)
     new_batch.setdefault("started", 0)
-    last_bbl, last_addr = completed[-1]
-    toast = {
-        "bbl":     last_bbl,
-        "address": last_addr,
-        "more":    len(completed) - 1,
-        "tick":    _n,
-    }
-    return status, toast, new_batch
+    new_queue = no_update
+    if failed:
+        cancelled = 0
+        for bbl in list(status.keys()):
+            if (status.get(bbl) or {}).get("status") == "queued":
+                del status[bbl]
+                cancelled += 1
+        new_batch["done"] = min(new_batch.get("started", 0), new_batch["done"] + cancelled)
+        new_queue = []
+        last_bbl, last_addr, reason = failed[-1]
+        toast = {"type": "error", "reason": reason, "bbl": last_bbl, "address": last_addr, "tick": _n}
+    elif completed:
+        last_bbl, last_addr = completed[-1]
+        toast = {
+            "type":    "success",
+            "bbl":     last_bbl,
+            "address": last_addr,
+            "more":    len(completed) - 1,
+            "tick":    _n,
+        }
+    else:
+        toast = no_update
+    return status, toast, new_batch, new_queue
 
 
 @callback(
@@ -1253,14 +1457,102 @@ def manage_lookup_poll(status):
     return not has_loading
 
 
+# ── Lookup queue: serial worker ──────────────────────────────────────────
+
+
+@callback(
+    Output("lookup-status", "data", allow_duplicate=True),
+    Output("lookup-queue", "data", allow_duplicate=True),
+    Output("lookup-toast-store", "data", allow_duplicate=True),
+    Output("task-batch", "data", allow_duplicate=True),
+    Input("lookup-status", "data"),
+    Input("lookup-queue", "data"),
+    State("task-batch", "data"),
+    prevent_initial_call=True,
+)
+def process_lookup_queue(status, queue, batch):
+    """Serial worker: at most one lookup is in flight at a time. Checks the
+    local cache first — if the result already exists, resolves immediately and
+    fires the toast without calling the agent. Otherwise fires the webhook."""
+    status = dict(status or {})
+    queue = list(queue or [])
+    if any((v or {}).get("status") == "loading" for v in status.values()):
+        return no_update, no_update, no_update, no_update
+    if not queue:
+        return no_update, no_update, no_update, no_update
+    next_bbl = queue.pop(0)
+    props = FEATURES_BY_BBL.get(next_bbl)
+    if not props:
+        return no_update, queue, no_update, no_update
+    # Cache check: if this BBL was already looked up, resolve immediately.
+    cached = _fetch_enrichment_result(next_bbl)
+    if cached is not None:
+        address = props.get("address")
+        status[next_bbl] = {"status": "done", "address": address, "data": cached}
+        toast = {"bbl": next_bbl, "address": address, "more": 0, "tick": time.time()}
+        new_batch = dict(batch or {})
+        new_batch["done"] = new_batch.get("done", 0) + 1
+        new_batch.setdefault("started", 0)
+        return status, queue, toast, new_batch
+    entry = dict(status.get(next_bbl) or {})
+    entry["status"]     = "loading"
+    entry["address"]    = entry.get("address") or props.get("address")
+    entry["started_at"] = time.time()
+    status[next_bbl] = entry
+    threading.Thread(
+        target=_fire_enrichment_webhook, args=(next_bbl, props), daemon=True,
+    ).start()
+    return status, queue, no_update, no_update
+
+
+@callback(
+    Output("lookup-queue", "data", allow_duplicate=True),
+    Output("lookup-status", "data", allow_duplicate=True),
+    Output("task-batch", "data", allow_duplicate=True),
+    Input("cancel-queue-btn", "n_clicks"),
+    State("lookup-status", "data"),
+    State("task-batch", "data"),
+    State("lookup-queue", "data"),
+    prevent_initial_call=True,
+)
+def cancel_queue(n, status, batch, queue):
+    if not n:
+        return no_update, no_update, no_update
+    status = dict(status or {})
+    cancelled = 0
+    for bbl in list(status.keys()):
+        if (status.get(bbl) or {}).get("status") == "queued":
+            del status[bbl]
+            cancelled += 1
+    if cancelled == 0 and not queue:
+        return no_update, no_update, no_update
+    new_batch = dict(batch or {})
+    new_batch["started"] = max(0, new_batch.get("started", 0) - cancelled)
+    new_batch.setdefault("done", 0)
+    return [], status, new_batch
+
+
+@callback(
+    Output("cancel-queue-btn", "style"),
+    Input("lookup-queue", "data"),
+)
+def manage_cancel_btn(queue):
+    if queue:
+        return {"fontSize": "10px", "padding": "1px 8px", "display": "inline-block"}
+    return {"fontSize": "10px", "padding": "1px 8px", "display": "none"}
+
+
 # ── Task progress bar ────────────────────────────────────────────────────
 
 
 _TASK_BAR_HIDDEN_STYLE = {"display": "none"}
 _TASK_BAR_VISIBLE_STYLE = {
-    "position": "fixed", "top": "50px", "left": 0, "right": 0, "zIndex": 1500,
-    "padding": "8px 16px", "background": "rgba(18,18,42,0.97)",
-    "borderBottom": "1px solid #2a2a4a", "display": "block",
+    "width": "100%",
+    "padding": "8px 16px",
+    "background": "rgba(18,18,42,0.97)",
+    "borderBottom": "1px solid #2a2a4a",
+    "display": "block",
+    "flexShrink": "0",
 }
 
 
@@ -1313,22 +1605,28 @@ _MODAL_BTN_VISIBLE = {"display": "inline-block"}
 
 @callback(
     Output("modal-lookup-btn", "style"),
+    Output("modal-shortlist-btn", "style"),
     Input("modal-building-id", "data"),
     Input("lookup-status", "data"),
 )
-def manage_modal_lookup_btn(building_id, lookup_status):
+def manage_modal_action_buttons(building_id, lookup_status):
     if not building_id:
-        return _MODAL_BTN_HIDDEN
+        return _MODAL_BTN_HIDDEN, _MODAL_BTN_HIDDEN
     props = FEATURES_BY_ID.get(building_id)
     if not props:
-        return _MODAL_BTN_HIDDEN
+        return _MODAL_BTN_HIDDEN, _MODAL_BTN_HIDDEN
     bbl = _bbl_for(props)
     state = ((lookup_status or {}).get(bbl) or {}).get("status", "idle")
-    return _MODAL_BTN_VISIBLE if state == "idle" else _MODAL_BTN_HIDDEN
+    # Lookup btn: idle (initial) or timeout (retry). Hidden while queued/loading/done.
+    lookup_style    = _MODAL_BTN_VISIBLE if state in ("idle", "timeout") else _MODAL_BTN_HIDDEN
+    shortlist_style = _MODAL_BTN_VISIBLE if state == "done" else _MODAL_BTN_HIDDEN
+    return lookup_style, shortlist_style
 
 
 @callback(
     Output("lookup-toast", "is_open"),
+    Output("lookup-toast", "header"),
+    Output("lookup-toast", "icon"),
     Output("lookup-toast-msg", "children"),
     Input("lookup-toast-store", "data"),
     State("lookup-status", "data"),
@@ -1336,9 +1634,22 @@ def manage_modal_lookup_btn(building_id, lookup_status):
 )
 def show_lookup_toast(payload, lookup_status):
     if not payload or not payload.get("bbl"):
-        return no_update, no_update
+        return no_update, no_update, no_update, no_update
+    addr = payload.get("address") or payload["bbl"]
+
+    if payload.get("type") == "error":
+        detail = (
+            "Request failed"
+            if payload.get("reason") == "error"
+            else "Lookup timed out"
+        )
+        msg = html.Div([
+            html.Div(addr, className="small fw-bold mb-1"),
+            html.Div(f"{detail} — remaining jobs cancelled.", className="small text-danger"),
+        ])
+        return True, "Lookup failed", "danger", msg
+
     bbl  = payload["bbl"]
-    addr = payload.get("address") or bbl
     more = payload.get("more") or 0
     data = _unwrap_agent_data(((lookup_status or {}).get(bbl) or {}).get("data"))
 
@@ -1358,9 +1669,7 @@ def show_lookup_toast(payload, lookup_status):
 
     top_landlord = ((data.get("landlords") or [{}])[0] or {}).get("name")
     if top_landlord:
-        parts.append(
-            html.Div(top_landlord, className="small fst-italic mb-1")
-        )
+        parts.append(html.Div(top_landlord, className="small fst-italic mb-1"))
 
     flags = data.get("flags") or []
     if flags:
@@ -1380,25 +1689,295 @@ def show_lookup_toast(payload, lookup_status):
             )
         )
 
-    return True, html.Div(parts)
+    return True, "Owner details found", "success", html.Div(parts)
+
+
+# ── Settings modal ──────────────────────────────────────────────────────
+
+
+@callback(
+    Output("settings-modal", "is_open"),
+    Input("settings-btn", "n_clicks"),
+    State("settings-modal", "is_open"),
+    prevent_initial_call=True,
+)
+def toggle_settings_modal(n, is_open):
+    return not is_open if n else is_open
+
+
+# ── Discovered owners ────────────────────────────────────────────────────
+
+
+def _all_discovered_owners(lookup_status):
+    done_bids = []
+    for bbl, v in (lookup_status or {}).items():
+        if (v or {}).get("status") == "done":
+            props = FEATURES_BY_BBL.get(bbl)
+            if props:
+                done_bids.append(props["id"])
+    return _group_owners_from_buildings(done_bids, lookup_status)
+
+
+_ALL_OWNERS_PAGE = 10
+
+
+def _owner_card(o):
+    has_email = bool(o.get("email"))
+    bs = o.get("buildings", [])
+    building_lines = [
+        html.Small(b["address"], className="text-secondary d-block",
+                   style={"fontSize": "10px"})
+        for b in bs[:3]
+    ]
+    if len(bs) > 3:
+        building_lines.append(
+            html.Small(f"+{len(bs)-3} more", className="text-secondary",
+                       style={"fontSize": "10px"})
+        )
+    contact_bits = [b for b in [o.get("phone"), o.get("email")] if b]
+    row_children = [
+        html.Div(
+            [
+                html.Small(o.get("name") or "(unnamed)",
+                           className="fw-semibold d-block",
+                           style={"fontSize": "11px"}),
+                *building_lines,
+                html.Small(" · ".join(contact_bits),
+                           className="text-info d-block",
+                           style={"fontSize": "10px"}) if contact_bits else None,
+            ],
+            style={"flex": "1", "minWidth": 0, "overflow": "hidden"},
+        ),
+    ]
+    if has_email:
+        row_children.append(
+            dbc.Button(
+                "+ Shortlist",
+                id={"type": "all-owner-shortlist-btn", "id": o.get("owner_key")},
+                size="sm",
+                color="success",
+                outline=True,
+                style={"fontSize": "10px", "padding": "1px 5px", "flexShrink": "0"},
+            )
+        )
+    return html.Div(
+        row_children,
+        className="d-flex align-items-start gap-1 mb-1 p-1 rounded",
+        style={"background": "#1e1e3a"},
+    )
+
+
+@callback(
+    Output("all-owners-items", "children"),
+    Output("all-owners-count", "children"),
+    Output("all-owners-toggle-btn", "children"),
+    Output("all-owners-toggle-btn", "style"),
+    Input("lookup-status", "data"),
+    Input("all-owners-expanded", "data"),
+)
+def render_all_owners(lookup_status, expanded):
+    owners = _all_discovered_owners(lookup_status)
+    total = len(owners)
+    btn_hidden = {"fontSize": "10px", "display": "none"}
+    btn_visible = {"fontSize": "10px", "display": "inline-block"}
+    if not owners:
+        return html.P("No lookups yet.", className="small text-secondary"), "", "", btn_hidden
+    displayed = owners if expanded else owners[:_ALL_OWNERS_PAGE]
+    items = [_owner_card(o) for o in displayed]
+    if total <= _ALL_OWNERS_PAGE:
+        return items, str(total), "", btn_hidden
+    btn_label = "Hide" if expanded else f"Show all ({total})"
+    return items, str(total), btn_label, btn_visible
+
+
+@callback(
+    Output("all-owners-expanded", "data"),
+    Input("all-owners-toggle-btn", "n_clicks"),
+    State("all-owners-expanded", "data"),
+    prevent_initial_call=True,
+)
+def toggle_all_owners(n, expanded):
+    return not expanded if n else expanded
+
+
+# ── Selection mutations ──────────────────────────────────────────────────
+
+
+@callback(
+    Output("selected-buildings", "data"),
+    Output("bbox-store", "data", allow_duplicate=True),
+    Output("subway-selection-store", "data", allow_duplicate=True),
+    Input("buildings-layer", "clickData"),
+    Input("bbox-store", "data"),
+    Input("subway-selection-store", "data"),
+    Input("radius-slider", "value"),
+    Input("clear-selection-btn", "n_clicks"),
+    Input({"type": "deselect-btn", "id": ALL}, "n_clicks"),
+    State("selected-buildings", "data"),
+    prevent_initial_call=True,
+)
+def update_selection(click_data, bbox, subway_sel, radius_km, _clear, _deselects, current):
+    trig = ctx.triggered_id
+    current = list(current or [])
+
+    # Clear button: empty selection AND clear bbox/subway visuals.
+    if trig == "clear-selection-btn":
+        return [], None, None
+
+    # × on a specific card: remove that one building.
+    if isinstance(trig, dict) and trig.get("type") == "deselect-btn":
+        bid = trig.get("id")
+        return [x for x in current if x != bid], no_update, no_update
+
+    # BBox drag committed: REPLACE selection with buildings in bbox.
+    # BBox cleared by JS background-click reset (bbox=None): clear selection.
+    if trig == "bbox-store":
+        if bbox:
+            return _building_ids_in_bbox(bbox), no_update, no_update
+        return [], no_update, no_update
+
+    # Subway stop click committed: REPLACE with buildings in radius.
+    # Subway cleared by background-click reset (subway_sel=None): clear selection.
+    if trig == "subway-selection-store":
+        if subway_sel:
+            return (
+                _building_ids_in_radius(subway_sel["lat"], subway_sel["lng"], radius_km),
+                no_update, no_update,
+            )
+        return [], no_update, no_update
+
+    # Radius slider while a subway selection is active: refresh in-radius set.
+    if trig == "radius-slider" and subway_sel:
+        return (
+            _building_ids_in_radius(subway_sel["lat"], subway_sel["lng"], radius_km),
+            no_update, no_update,
+        )
+
+    # Building marker click on the map: toggle that building.
+    if trig == "buildings-layer" and click_data:
+        bid = (click_data.get("properties") or {}).get("id")
+        if not bid:
+            return no_update, no_update, no_update
+        if bid in current:
+            return [x for x in current if x != bid], no_update, no_update
+        return [*current, bid], no_update, no_update
+
+    return no_update, no_update, no_update
+
+
+@callback(
+    Output("selected-building-layer", "data"),
+    Input("selected-buildings", "data"),
+)
+def highlight_selected(selected_ids):
+    if not selected_ids:
+        return EMPTY_GEOJSON
+    features = []
+    for bid in selected_ids:
+        props = FEATURES_BY_ID.get(bid)
+        if not props:
+            continue
+        # Recover the original geometry from ALL_FEATURES
+        f = next((g for g in ALL_FEATURES if g["properties"]["id"] == bid), None)
+        if f:
+            features.append(f)
+    return {"type": "FeatureCollection", "features": features}
+
+
+# ── Bulk lookup / add-to-shortlist on the selection ─────────────────────
+
+
+@callback(
+    Output("lookup-status", "data", allow_duplicate=True),
+    Output("task-batch", "data", allow_duplicate=True),
+    Output("lookup-queue", "data", allow_duplicate=True),
+    Input("bulk-lookup-btn", "n_clicks"),
+    State("selected-buildings", "data"),
+    State("lookup-status", "data"),
+    State("task-batch", "data"),
+    State("lookup-queue", "data"),
+    prevent_initial_call=True,
+)
+def bulk_lookup_selected(n, selected_ids, status, batch, queue):
+    if not n or not selected_ids:
+        return no_update, no_update, no_update
+    status = dict(status or {})
+    batch = dict(batch or {})
+    queue = list(queue or [])
+    added = 0
+    for bid in selected_ids:
+        props = FEATURES_BY_ID.get(bid)
+        if not props:
+            continue
+        bbl = _bbl_for(props)
+        if not bbl:
+            continue
+        new_status, new_batch, new_queue = _queue_lookup_for_bbl(bbl, status, batch, queue)
+        if new_status is None:
+            continue
+        status = new_status
+        batch  = new_batch
+        queue  = new_queue
+        added += 1
+    if added == 0:
+        return no_update, no_update, no_update
+    return status, batch, queue
+
+
+# ── Owner shortlist ─────────────────────────────────────────────────────
+
+
+def _merge_owners_into_shortlist(shortlist, new_owners):
+    by_key = {o.get("owner_key"): o for o in shortlist}
+    for o in new_owners:
+        key = o["owner_key"]
+        if key in by_key:
+            existing = by_key[key]
+            seen = {b["bbl"] for b in existing.get("buildings", [])}
+            for b in o["buildings"]:
+                if b["bbl"] not in seen:
+                    existing["buildings"].append(b)
+                    seen.add(b["bbl"])
+        else:
+            shortlist.append(o)
+            by_key[key] = o
+    return shortlist
 
 
 @callback(
     Output("shortlist-store", "data"),
-    Input("add-btn", "n_clicks"),
-    State("buildings-layer", "clickData"),
+    Input("bulk-shortlist-btn", "n_clicks"),
+    Input("modal-shortlist-btn", "n_clicks"),
+    Input({"type": "all-owner-shortlist-btn", "id": ALL}, "n_clicks"),
+    State("selected-buildings", "data"),
+    State("modal-building-id", "data"),
+    State("lookup-status", "data"),
     State("shortlist-store", "data"),
     prevent_initial_call=True,
 )
-def add_to_shortlist(_, click_data, shortlist):
-    if not click_data:
+def add_owners_to_shortlist(_bulk, _modal, _per_owner, selected_ids, modal_bid, lookup_status, shortlist):
+    trig = ctx.triggered_id
+    shortlist = list(shortlist or [])
+    if trig == "bulk-shortlist-btn":
+        candidates = list(selected_ids or [])
+        new_owners = _group_owners_from_buildings(candidates, lookup_status or {})
+    elif trig == "modal-shortlist-btn":
+        candidates = [modal_bid] if modal_bid else []
+        new_owners = _group_owners_from_buildings(candidates, lookup_status or {})
+    elif isinstance(trig, dict) and trig.get("type") == "all-owner-shortlist-btn":
+        if not any(_per_owner or []):
+            return no_update
+        owner_key = trig["id"]
+        all_owners = _all_discovered_owners(lookup_status)
+        target = next((o for o in all_owners if o.get("owner_key") == owner_key), None)
+        if not target:
+            return no_update
+        new_owners = [target]
+    else:
         return no_update
-    shortlist = shortlist or []
-    p = click_data.get("properties", {})
-    bid = p.get("id")
-    if bid and not any(b.get("id") == bid for b in shortlist):
-        shortlist = [*shortlist, p]
-    return shortlist
+    if not new_owners:
+        return no_update
+    return _merge_owners_into_shortlist(shortlist, new_owners)
 
 
 @callback(
@@ -1408,37 +1987,46 @@ def add_to_shortlist(_, click_data, shortlist):
 )
 def render_shortlist(shortlist):
     if not shortlist:
-        return html.P("None saved yet.", className="small text-secondary"), ""
+        return html.P("No owners yet.", className="small text-secondary"), ""
     items = []
-    for b in shortlist:
+    for o in shortlist:
+        bs = o.get("buildings", [])
+        building_lines = [
+            html.Small(b["address"], className="text-secondary d-block",
+                       style={"fontSize": "10px"})
+            for b in bs[:3]
+        ]
+        if len(bs) > 3:
+            building_lines.append(
+                html.Small(f"+{len(bs)-3} more", className="text-secondary",
+                           style={"fontSize": "10px"})
+            )
+        contact_bits = [b for b in [o.get("phone"), o.get("email")] if b]
         items.append(
             html.Div(
                 [
                     html.Div(
                         [
-                            html.Small(
-                                b.get("address", ""),
-                                className="fw-semibold d-block",
-                                style={"fontSize": "11px"},
-                            ),
-                            html.Small(
-                                f"ZIP {b.get('zip', '')}",
-                                className="text-secondary",
-                                style={"fontSize": "10px"},
-                            ),
+                            html.Small(o.get("name") or "(unnamed)",
+                                       className="fw-semibold d-block",
+                                       style={"fontSize": "11px"}),
+                            *building_lines,
+                            html.Small(" · ".join(contact_bits),
+                                       className="text-info d-block",
+                                       style={"fontSize": "10px"}) if contact_bits else None,
                         ],
                         style={"flex": "1", "minWidth": 0, "overflow": "hidden"},
                     ),
                     dbc.Button(
                         "×",
-                        id={"type": "remove-btn", "id": b.get("id")},
+                        id={"type": "remove-owner-btn", "id": o.get("owner_key")},
                         size="sm",
                         color="danger",
                         outline=True,
                         style={"fontSize": "11px", "padding": "1px 5px", "flexShrink": "0"},
                     ),
                 ],
-                className="d-flex align-items-center gap-1 mb-1 p-1 rounded",
+                className="d-flex align-items-start gap-1 mb-1 p-1 rounded",
                 style={"background": "#1e1e3a"},
             )
         )
@@ -1447,15 +2035,15 @@ def render_shortlist(shortlist):
 
 @callback(
     Output("shortlist-store", "data", allow_duplicate=True),
-    Input({"type": "remove-btn", "id": ALL}, "n_clicks"),
+    Input({"type": "remove-owner-btn", "id": ALL}, "n_clicks"),
     State("shortlist-store", "data"),
     prevent_initial_call=True,
 )
-def remove_from_shortlist(n_clicks_list, shortlist):
+def remove_owner_from_shortlist(n_clicks_list, shortlist):
     if not any(n_clicks_list) or not shortlist:
         return no_update
-    remove_id = ctx.triggered_id["id"]
-    return [b for b in shortlist if b.get("id") != remove_id]
+    remove_key = ctx.triggered_id["id"]
+    return [o for o in shortlist if o.get("owner_key") != remove_key]
 
 
 @callback(
@@ -1475,21 +2063,43 @@ def toggle_modal(n, is_open):
 )
 def render_previews(shortlist, template):
     if not shortlist:
-        return html.P("No buildings in shortlist.", className="small text-secondary")
+        return html.P("No owners in shortlist.", className="small text-secondary")
     items = []
-    for i, b in enumerate(shortlist):
-        preview = _interpolate(template or "", {**b, "sender_email": "(your email)"})
+    for o in shortlist:
+        bs = o.get("buildings", [])
+        addresses_str = "; ".join(b["address"] for b in bs)
+        first = bs[0] if bs else {}
+        ctx_vars = {
+            "owner_name":    o.get("name") or "there",
+            "address":       first.get("address", ""),
+            "addresses":     addresses_str,
+            "building_count": len(bs),
+            "zip":           first.get("zip", ""),
+            "block":         first.get("block", ""),
+            "lot":           first.get("lot", ""),
+            "sender_email":  "(your email)",
+        }
+        preview = _interpolate(template or "", ctx_vars)
         items.append(
             dbc.Card(
                 [
                     dbc.CardHeader(
                         [
-                            html.Small(b.get("address"), className="fw-bold d-block"),
+                            html.Small(
+                                f"{o.get('name')} · {len(bs)} building{'s' if len(bs)!=1 else ''}",
+                                className="fw-bold d-block",
+                            ),
+                            html.Small(
+                                addresses_str,
+                                className="text-secondary d-block",
+                                style={"fontSize": "10px"},
+                            ),
                             dbc.Input(
-                                id={"type": "owner-email", "id": b.get("id", str(i))},
+                                id={"type": "owner-email", "id": o.get("owner_key")},
                                 placeholder="owner@example.com",
                                 type="email",
                                 size="sm",
+                                value=o.get("email") or "",
                                 className="mt-1",
                                 debounce=True,
                             ),
@@ -1563,9 +2173,7 @@ def render_previews(shortlist, template):
     prevent_initial_call=True,
 )
 def handle_subway_click(click_data, clear_clicks, radius_km):
-    print(f"[handle_subway_click] triggered_id={ctx.triggered_id} click_data={click_data}", flush=True)
     if ctx.triggered_id == "clear-selection-btn":
-        print("  → clearing subway selection", flush=True)
         return None, {"display": "none"}, ""
     if not click_data:
         return no_update, no_update, no_update
@@ -1575,7 +2183,6 @@ def handle_subway_click(click_data, clear_clicks, radius_km):
     lng, lat = coords[0], coords[1]
     name = (click_data.get("properties") or {}).get("name", "station")
     sel = {"lat": lat, "lng": lng, "name": name}
-    print(f"  → setting subway selection: {sel}", flush=True)
     return sel, {"display": "block"}, f"Radius: {name}"
 
 
