@@ -27,18 +27,20 @@ from playwright.async_api import (
 PROFILE_DIR = Path.home() / ".claude" / "playwright-profiles" / "landlord-lookup"
 
 
-async def _apply_location_filter(page: Page, location: str) -> bool:
-    """Type into ContactOut's Location react-select and pick the first matching option.
+async def _apply_react_select_filter(page: Page, label_text: str, value: str) -> bool:
+    """Type `value` into the react-select whose label is `label_text` and pick
+    the first matching autocomplete option. Returns True on success.
 
-    The Location field is a react-select with no stable selector (index varies),
-    so we locate it by walking up from the "Location" label text node.
+    Most ContactOut filters are react-selects with no stable selectors (the
+    `react-select-N` index shifts), so we locate by walking up from the label's
+    text node to find a sibling `input[id^="react-select-"]`.
     """
     input_id = await page.evaluate(
-        """() => {
+        """(label) => {
             const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
             while (walker.nextNode()) {
                 const tn = walker.currentNode;
-                if ((tn.nodeValue || '').trim() === 'Location') {
+                if ((tn.nodeValue || '').trim() === label) {
                     let p = tn.parentElement;
                     for (let i = 0; i < 8 && p; i++) {
                         const inp = p.querySelector('input[id^="react-select-"]');
@@ -48,40 +50,32 @@ async def _apply_location_filter(page: Page, location: str) -> bool:
                 }
             }
             return null;
-        }"""
+        }""",
+        label_text,
     )
     if not input_id:
         return False
 
-    loc = page.locator(f"#{input_id}")
-    await loc.scroll_into_view_if_needed()
-    await loc.click()
-    await loc.type(location, delay=80)
+    field = page.locator(f"#{input_id}")
+    await field.scroll_into_view_if_needed()
+    await field.click()
+    await field.type(value, delay=80)
     await page.wait_for_timeout(1800)
 
     option = page.locator('[class*="contactout-select__option"]').first
     try:
         await option.wait_for(timeout=5000)
         await option.click()
+        return True
     except PlaywrightTimeout:
         return False
-
-    await page.wait_for_timeout(500)
-    search_btn = page.locator("button:has-text('Search')").first
-    try:
-        await search_btn.scroll_into_view_if_needed()
-        await search_btn.click(timeout=4000)
-        await page.wait_for_timeout(3500)
-    except PlaywrightTimeout:
-        pass
-
-    return True
 
 
 async def search_contactout(
     context: BrowserContext,
     name: str,
     location: str | None = None,
+    company: str | None = None,
     reveal_first: bool = True,
 ) -> dict:
     page = await context.new_page()
@@ -97,15 +91,22 @@ async def search_contactout(
         await page.close()
         return {"error": f"No ContactOut results for {name!r}"}
 
+    location_applied = False
+    company_applied = False
     if location:
-        applied = await _apply_location_filter(page, location)
-        if applied:
-            search_btn = page.locator("button:has-text('Search')").first
-            try:
-                await search_btn.click(timeout=4000)
-            except PlaywrightTimeout:
-                pass
-            await page.wait_for_timeout(3500)
+        location_applied = await _apply_react_select_filter(page, "Location", location)
+    if company:
+        company_applied = await _apply_react_select_filter(page, "Company", company)
+
+    if location_applied or company_applied:
+        await page.wait_for_timeout(500)
+        search_btn = page.locator("button:has-text('Search')").first
+        try:
+            await search_btn.scroll_into_view_if_needed()
+            await search_btn.click(timeout=4000)
+        except PlaywrightTimeout:
+            pass
+        await page.wait_for_timeout(3500)
 
     profile_count_text = ""
     counter = page.locator("text=/of \\d+ profiles?/i").first
@@ -141,6 +142,7 @@ async def search_contactout(
     return {
         "name": name,
         "location_filter": location,
+        "company_filter": company,
         "profile_count": profile_count_text,
         "result_locations": locations_in_results[:8],
         "emails": emails,
@@ -151,8 +153,9 @@ async def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("name", nargs="?", help='Person name, e.g. "Stephen Judson"')
     parser.add_argument("--location", help='e.g. "New York" or "Brooklyn"')
+    parser.add_argument("--company", help='Company filter, e.g. "Judson Realty"')
     parser.add_argument("--login", action="store_true", help="Open ContactOut for manual sign-in.")
-    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--headless", action="store_false")
     parser.add_argument("--no-reveal", action="store_true", help="Don't click View email.")
     args = parser.parse_args()
 
@@ -180,6 +183,7 @@ async def main() -> None:
                 context,
                 args.name,
                 location=args.location,
+                company=args.company,
                 reveal_first=not args.no_reveal,
             )
         finally:

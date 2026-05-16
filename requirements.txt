@@ -4,3 +4,6 @@ dash-bootstrap-components>=1.6
 dash-extensions>=1.0.0
 pandas>=2.0
 python-dotenv>=1.0
+claude-agent-sdk>=0.1
+pydantic>=2.0
+playwright>=1.45

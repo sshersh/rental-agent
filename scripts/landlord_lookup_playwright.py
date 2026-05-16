@@ -85,8 +85,62 @@ async def lookup_whoownswhat(context: BrowserContext, address: str) -> dict:
         if m:
             info[key] = m.group(1).strip()
 
+    info["portfolio"] = await _extract_portfolio(page)
+
     await page.close()
     return info
+
+
+async def _extract_portfolio(page: Page) -> list[dict]:
+    """Click the Portfolio tab and return every associated building."""
+    portfolio_tab = page.locator('button:has-text("Portfolio"), a:has-text("Portfolio"), [role="tab"]:has-text("Portfolio")').first
+    try:
+        await portfolio_tab.scroll_into_view_if_needed()
+        await portfolio_tab.click(timeout=4000)
+    except PlaywrightTimeout:
+        try:
+            await page.locator('text="Portfolio"').first.click(timeout=4000)
+        except PlaywrightTimeout:
+            return []
+
+    await page.wait_for_timeout(2500)
+
+    rows = await page.evaluate(
+        """() => {
+            const tables = Array.from(document.querySelectorAll('table'));
+            const portfolio = tables.find(t => {
+                const heads = Array.from(t.querySelectorAll('th')).map(th => th.textContent.trim());
+                return heads.includes('Landlord');
+            });
+            if (!portfolio) return [];
+            return Array.from(portfolio.querySelectorAll('tbody tr')).map(r =>
+                Array.from(r.querySelectorAll('td')).map(td => td.textContent.trim())
+            );
+        }"""
+    )
+
+    boroughs = {"MANHATTAN", "BROOKLYN", "QUEENS", "BRONX", "STATEN ISLAND"}
+    out: list[dict] = []
+    for cells in rows:
+        if not cells:
+            continue
+        address = next((c for c in cells if c and c not in boroughs and not c.isdigit()), "")
+        zip_code = next((c for c in cells if re.fullmatch(r"\d{5}", c or "")), None)
+        borough = next((c for c in cells if c in boroughs), None)
+        bbl = next((c for c in cells if re.fullmatch(r"\d{10}", c or "")), None)
+        landlord = next((c for c in cells if c and "+" in c), None)
+        if address:
+            entry = {"address": address}
+            if borough:
+                entry["borough"] = borough
+            if zip_code:
+                entry["zip"] = zip_code
+            if bbl:
+                entry["bbl"] = bbl
+            if landlord:
+                entry["landlord"] = landlord
+            out.append(entry)
+    return out
 
 
 async def main() -> None:
@@ -98,7 +152,7 @@ async def main() -> None:
         help='ContactOut location filter (default: "New York"). Pass empty string to disable.',
     )
     parser.add_argument("--login", action="store_true", help="Open ContactOut for manual sign-in, then exit.")
-    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--headless", action="store_false")
     args = parser.parse_args()
 
     PROFILE_DIR.mkdir(parents=True, exist_ok=True)
