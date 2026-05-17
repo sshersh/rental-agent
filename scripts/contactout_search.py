@@ -83,6 +83,28 @@ async def open_contactout_search(page: Page, name: str) -> None:
     await page.wait_for_timeout(3500)
 
 
+async def is_cloudflare_challenge(page: Page) -> bool:
+    """True if `page` is stuck on a Cloudflare "Just a moment..." interstitial.
+
+    ContactOut intermittently serves these to headless Chromium; when it does,
+    no search UI ever renders, so every downstream selector silently returns
+    empty. Detect explicitly so callers can fail loud instead of reporting
+    zero profiles.
+    """
+    title = (await page.title()) or ""
+    if title.strip().lower().startswith("just a moment"):
+        return True
+    try:
+        body = await page.locator("body").inner_text(timeout=1000)
+    except Exception:
+        return False
+    snippet = body[:500].lower()
+    return (
+        "performing security verification" in snippet
+        or "checking your browser" in snippet
+    )
+
+
 async def get_profile_count(page: Page) -> str:
     counter = page.locator("text=/of \\d+ profiles?/i").first
     if await counter.count() > 0:
@@ -268,6 +290,8 @@ async def main() -> None:
         context = await p.chromium.launch_persistent_context(
             user_data_dir=str(PROFILE_DIR),
             headless=headless,
+            args=["--disable-blink-features=AutomationControlled"],
+            ignore_default_args=["--enable-automation"],
         )
 
         if args.login:

@@ -19,20 +19,16 @@ from dash_extensions.javascript import assign
 from dotenv import load_dotenv
 
 import agent_cache
-from agent_runner import (
-    debug_log as agent_debug_log,
-    run_landlord_lookup,
-    _ensure_debug_handler as _ensure_agent_debug_handler,
-)
+import agent_runner
+from agent_runner import run_landlord_lookup
 from agent_to_storage import translate as translate_agent_result
 
 load_dotenv()
 agent_cache.init_db()
 
 LOOKUP_TIMEOUT_SECONDS = 240   # local agent runs (WoW + multi-owner ContactOut) take ~1–3 min
-_LOOKUP_ERRORS: dict = {}      # bbl -> True; written by agent worker thread on failure
+_LOOKUP_ERRORS: dict = {}      # bbl -> reason str ("error" | "cloudflare"); written by agent worker thread on failure
 AGENT_HEADED = False           # set by --headed at startup; surfaces the browser the agent drives
-AGENT_DEBUG  = False           # set by --agent-debug; prints CLI stderr + SDK messages per call
 
 # ── Data loading ───────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
@@ -318,36 +314,7 @@ SIDEBAR = html.Div(
             ],
             className="p-3 border-bottom border-secondary",
         ),
-        # ── Shortlisted owners ────────────────────────────────────────
-        html.Div(
-            [
-                html.Div(
-                    [
-                        html.Span("Shortlisted owners", className="fw-bold small"),
-                        html.Span(
-                            id="shortlist-count",
-                            className="badge bg-primary rounded-pill ms-2",
-                            style={"fontSize": "10px"},
-                        ),
-                    ],
-                    className="d-flex align-items-center mb-2",
-                ),
-                html.Div(
-                    id="shortlist-items",
-                    children=html.P("No owners yet.", className="small text-secondary"),
-                ),
-                dbc.Button(
-                    "Compose Email →",
-                    id="open-email-btn",
-                    color="success",
-                    size="sm",
-                    outline=True,
-                    className="w-100 mt-2",
-                ),
-            ],
-            className="p-3 border-bottom border-secondary",
-        ),
-        # ── Discovered owners (all past lookups) ──────────────────────
+        # ── Discovered owners (every primary landlord across all sessions) ──
         html.Div(
             [
                 html.Div(
@@ -373,6 +340,35 @@ SIDEBAR = html.Div(
                 html.Div(
                     id="all-owners-items",
                     children=html.P("No lookups yet.", className="small text-secondary"),
+                ),
+            ],
+            className="p-3 border-bottom border-secondary",
+        ),
+        # ── Shortlisted owners ────────────────────────────────────────
+        html.Div(
+            [
+                html.Div(
+                    [
+                        html.Span("Shortlisted owners", className="fw-bold small"),
+                        html.Span(
+                            id="shortlist-count",
+                            className="badge bg-primary rounded-pill ms-2",
+                            style={"fontSize": "10px"},
+                        ),
+                    ],
+                    className="d-flex align-items-center mb-2",
+                ),
+                html.Div(
+                    id="shortlist-items",
+                    children=html.P("No owners yet.", className="small text-secondary"),
+                ),
+                dbc.Button(
+                    "Compose Email →",
+                    id="open-email-btn",
+                    color="success",
+                    size="sm",
+                    outline=True,
+                    className="w-100 mt-2",
                 ),
             ],
             className="p-3",
@@ -732,9 +728,12 @@ app.layout = html.Div(
         dcc.Store(id="task-batch", data={"started": 0, "done": 0}),
         dcc.Store(id="selected-buildings", storage_type="session", data=[]),
         dcc.Store(id="lookup-queue", data=[]),
+        dcc.Store(id="consecutive-timeouts", data=0),
         dcc.Store(id="job-bbls", data=[]),
         dcc.Store(id="job-tracker-minimized", data=False),
+        dcc.Interval(id="agent-log-poll", interval=1000, n_intervals=0, disabled=True),
         dcc.Store(id="all-owners-expanded", data=False),
+        dcc.Store(id="coowners-expanded-keys", data=[]),
         dcc.Interval(id="sel-poll", interval=150, n_intervals=0),
         dcc.Interval(
             id="lookup-poll",
@@ -747,6 +746,16 @@ app.layout = html.Div(
             interval=2000,
             n_intervals=0,
             disabled=True,
+        ),
+        # Fires once ~500ms after the page loads, then never again. Prunes
+        # zombie `queued`/`loading` entries that survived in session storage
+        # after a hard app restart (the agent threads they referenced are
+        # dead) so they don't block new lookups.
+        dcc.Interval(
+            id="startup-heal",
+            interval=500,
+            n_intervals=0,
+            max_intervals=1,
         ),
         NAVBAR,
         html.Div(
@@ -813,8 +822,7 @@ def _lookup_button(bbl: str, status: str):
 def _job_tracker_card(props, bbl: str, status: str):
     """Compact card for a building inside the job tracker. Mirrors the look of
     a `_selected_cards` row (dark background + border, address text, status
-    button) but without the deselect (×) action — you can't drop a building
-    out of an already-in-flight job."""
+    button)."""
     return html.Div(
         [
             html.Div(
@@ -826,6 +834,83 @@ def _job_tracker_card(props, bbl: str, status: str):
         ],
         className="mb-1 p-2 rounded d-flex align-items-center gap-2",
         style={"background": "#1a1a2e", "border": "1px solid #2a2a4a"},
+    )
+
+
+# Matches the `[tool] name=... input={...}` lines that agent_runner emits per
+# tool use. Groups: ts (date+time), tool_name, input_json.
+_TOOL_LOG_LINE_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[tool\] name=(\S+) input=(.*)$"
+)
+
+
+def _recent_tool_calls(bbl: str, n: int = 5) -> list[str]:
+    """Read `.agent_logs/<bbl>.log`, filter for `[tool]` lines, format each as
+    `HH:MM:SS  short_tool_name(arg1='value', arg2='value')`, and return the
+    most-recent `n`. Returns [] if no tool calls yet (or no log file)."""
+    log = agent_runner.read_log(bbl)
+    if not log:
+        return []
+    formatted = []
+    for line in log.splitlines():
+        m = _TOOL_LOG_LINE_RE.match(line)
+        if not m:
+            continue
+        ts, full_name, input_json = m.groups()
+        # Drop the long `mcp__landlord__` prefix; show just the tool's name.
+        short = full_name.rsplit("__", 1)[-1]
+        try:
+            args = json.loads(input_json)
+            args_text = ", ".join(f"{k}={v!r}" for k, v in args.items())
+        except Exception:
+            args_text = input_json
+        time_only = ts.split(" ", 1)[1]
+        formatted.append(f"{time_only}  {short}({args_text})")
+    return formatted[-n:]
+
+
+def _job_tracker_section_header(label: str, count: int):
+    """Section divider inside the job tracker — `Running · 3`, etc."""
+    return html.Div(
+        f"{label} · {count}",
+        className="small fw-bold text-secondary mb-1",
+        style={
+            "marginTop": "8px",
+            "paddingBottom": "2px",
+            "borderBottom": "1px solid #2a2a4a",
+            "textTransform": "uppercase",
+            "letterSpacing": "0.04em",
+            "fontSize": "10px",
+        },
+    )
+
+
+def _inline_log_panel(bbl: str):
+    """The small auto-scrolling log block that renders directly under the
+    currently-loading card. Capped at 5 entries — `_recent_tool_calls`
+    already returns the trailing 5; CSS height also clamps it so the panel
+    can't push other cards off-screen."""
+    lines = _recent_tool_calls(bbl, n=5)
+    text = "\n".join(lines) if lines else "(waiting for first tool call…)"
+    return html.Pre(
+        text,
+        className="mb-2 p-2 rounded",
+        style={
+            "background": "#0d0d1f",
+            "border": "1px solid #2a2a4a",
+            "borderTop": "none",
+            "borderRadius": "0 0 4px 4px",
+            "color": "#b8b8d0",
+            "fontFamily": "ui-monospace, SFMono-Regular, monospace",
+            "fontSize": "10px",
+            # One log entry per line — no wrapping. Horizontal scroll kicks in
+            # when an entry (e.g. a long tool arg) exceeds the panel width.
+            "whiteSpace": "pre",
+            "margin": "-4px 0 8px 0",  # snug under the card above it
+            "maxHeight": "110px",
+            "overflowY": "auto",
+            "overflowX": "auto",
+        },
     )
 
 
@@ -1046,34 +1131,36 @@ def _run_local_agent(bbl: str, props: dict) -> None:
     the translated result to the SQLite cache. Fire-and-forget; runs in a
     thread so the Dash callback returns immediately. On any exception the
     bbl is flagged in _LOOKUP_ERRORS so the polling callback surfaces a
-    timeout/error toast."""
+    timeout/error toast. Per-run logs land in .agent_logs/<bbl>.log."""
     address = props.get("address")
-    if AGENT_DEBUG:
-        agent_debug_log(f"[agent] start bbl={bbl} address={address!r}")
+    if not address:
+        agent_runner.write_log(bbl, "[worker] abort: no address on props")
+        _LOOKUP_ERRORS[bbl] = "error"
+        return
     try:
-        if not address:
-            if AGENT_DEBUG:
-                agent_debug_log(f"[agent] abort bbl={bbl}: no address on props")
-            _LOOKUP_ERRORS[bbl] = True
-            return
-        agent_json = run_landlord_lookup(address, headed=AGENT_HEADED, debug=AGENT_DEBUG)
+        agent_json = run_landlord_lookup(address, bbl=bbl, headed=AGENT_HEADED)
         if not isinstance(agent_json, dict):
-            if AGENT_DEBUG:
-                agent_debug_log(
-                    f"[agent] fail bbl={bbl}: runner returned {type(agent_json).__name__} "
-                    f"(expected dict): {agent_json!r}"
-                )
-            _LOOKUP_ERRORS[bbl] = True
+            agent_runner.write_log(
+                bbl,
+                f"[worker] fail: runner returned {type(agent_json).__name__} "
+                f"(expected dict): {agent_json!r}",
+            )
+            _LOOKUP_ERRORS[bbl] = "error"
             return
         flat = translate_agent_result(agent_json, props)
         agent_cache.store_result(bbl, flat)
-        if AGENT_DEBUG:
-            agent_debug_log(f"[agent] done bbl={bbl}")
+        agent_runner.write_log(bbl, "[worker] stored result, done")
+    except agent_runner.ContactOutCloudflareError:
+        agent_runner.write_log(
+            bbl, "[worker] ContactOut blocked by Cloudflare; surfacing error"
+        )
+        _LOOKUP_ERRORS[bbl] = "cloudflare"
     except Exception:
-        if AGENT_DEBUG:
-            import traceback
-            agent_debug_log(f"[agent] exception bbl={bbl}:\n{traceback.format_exc()}")
-        _LOOKUP_ERRORS[bbl] = True
+        import traceback
+        agent_runner.write_log(
+            bbl, f"[worker] exception:\n{traceback.format_exc()}"
+        )
+        _LOOKUP_ERRORS[bbl] = "error"
 
 
 def _fetch_enrichment_result(building_id: str):
@@ -1479,31 +1566,38 @@ def start_lookup_from_modal(n, building_id, status, batch, queue, job_bbls):
     return new_status, new_batch, new_queue, bbls
 
 
+TIMEOUT_STREAK_LIMIT = 3   # consecutive timeouts before we cancel the queue
+
+
 @callback(
     Output("lookup-status", "data", allow_duplicate=True),
     Output("lookup-toast-store", "data", allow_duplicate=True),
     Output("task-batch", "data", allow_duplicate=True),
     Output("lookup-queue", "data", allow_duplicate=True),
+    Output("consecutive-timeouts", "data", allow_duplicate=True),
     Input("lookup-poll", "n_intervals"),
     State("lookup-status", "data"),
     State("task-batch", "data"),
     State("lookup-queue", "data"),
+    State("consecutive-timeouts", "data"),
     prevent_initial_call=True,
 )
-def poll_lookups(_n, status, batch, queue):
+def poll_lookups(_n, status, batch, queue, timeout_streak):
     status = dict(status or {})
     loading = [
         (bbl, v) for bbl, v in status.items() if (v or {}).get("status") == "loading"
     ]
     if not loading:
-        return no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update
     completed = []
     failed = []   # (bbl, address, reason) — "timeout" or "error"
     now = time.time()
     for bbl, v in loading:
-        if _LOOKUP_ERRORS.pop(bbl, None):
+        err_reason = _LOOKUP_ERRORS.pop(bbl, None)
+        if err_reason:
+            reason = err_reason if isinstance(err_reason, str) else "error"
             status[bbl] = {"status": "timeout", "address": v.get("address")}
-            failed.append((bbl, v.get("address") or bbl, "error"))
+            failed.append((bbl, v.get("address") or bbl, reason))
             continue
         data = _fetch_enrichment_result(bbl)
         if data is not None:
@@ -1515,12 +1609,25 @@ def poll_lookups(_n, status, batch, queue):
             status[bbl] = {"status": "timeout", "address": v.get("address"), "started_at": started_at}
             failed.append((bbl, v.get("address") or bbl, "timeout"))
     if not completed and not failed:
-        return no_update, no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update, no_update
+
     new_batch = dict(batch or {})
     new_batch["done"] = new_batch.get("done", 0) + len(completed) + len(failed)
     new_batch.setdefault("started", 0)
+
+    # Streak bookkeeping. Errors (hard failures like billing-out or a
+    # Cloudflare block on ContactOut) bypass the streak and cancel the queue
+    # immediately — they indicate a systemic problem, not a slow agent.
+    # Timeouts accumulate; any successful completion in this tick breaks the
+    # streak.
+    timeouts_now = sum(1 for _, _, r in failed if r == "timeout")
+    errors_now   = sum(1 for _, _, r in failed if r != "timeout")
+    streak = 0 if completed else int(timeout_streak or 0)
+    streak += timeouts_now
+    cancel_queue = errors_now > 0 or streak >= TIMEOUT_STREAK_LIMIT
+
     new_queue = no_update
-    if failed:
+    if cancel_queue:
         cancelled = 0
         for bbl in list(status.keys()):
             if (status.get(bbl) or {}).get("status") == "queued":
@@ -1528,8 +1635,20 @@ def poll_lookups(_n, status, batch, queue):
                 cancelled += 1
         new_batch["done"] = min(new_batch.get("started", 0), new_batch["done"] + cancelled)
         new_queue = []
+        streak = 0   # fresh slate once the queue is drained
+
+    if failed:
         last_bbl, last_addr, reason = failed[-1]
-        toast = {"type": "error", "reason": reason, "bbl": last_bbl, "address": last_addr, "tick": _n}
+        toast = {
+            "type":      "error",
+            "reason":    reason,
+            "bbl":       last_bbl,
+            "address":   last_addr,
+            "cancelled": cancel_queue,
+            "streak":    streak if not cancel_queue else 0,
+            "limit":     TIMEOUT_STREAK_LIMIT,
+            "tick":      _n,
+        }
     elif completed:
         last_bbl, last_addr = completed[-1]
         toast = {
@@ -1541,7 +1660,7 @@ def poll_lookups(_n, status, batch, queue):
         }
     else:
         toast = no_update
-    return status, toast, new_batch, new_queue
+    return status, toast, new_batch, new_queue, streak
 
 
 @callback(
@@ -1555,7 +1674,42 @@ def manage_lookup_poll(status):
     return not has_loading
 
 
-# ── Lookup queue: serial worker ──────────────────────────────────────────
+@callback(
+    Output("lookup-status", "data", allow_duplicate=True),
+    Output("lookup-queue", "data", allow_duplicate=True),
+    Output("task-batch", "data", allow_duplicate=True),
+    Output("job-bbls", "data", allow_duplicate=True),
+    Input("startup-heal", "n_intervals"),
+    State("lookup-status", "data"),
+    prevent_initial_call=True,
+)
+def heal_zombie_lookup_state(n, status):
+    """Runs once on page load (the `startup-heal` Interval has max_intervals=1).
+    `lookup-status` is session-stored so a hard app restart leaves orphan
+    `queued` / `loading` entries — the agent threads they reference are dead.
+    Drop them so new lookups aren't blocked by `_queue_lookup_for_bbl`'s
+    "already in-flight" guard. `done` and `timeout` are kept so the user's
+    resolved lookups stay visible on the cards."""
+    if not n:
+        return no_update, no_update, no_update, no_update
+    status = status or {}
+    zombies = {
+        bbl for bbl, v in status.items()
+        if (v or {}).get("status") in ("queued", "loading")
+    }
+    if not zombies:
+        return no_update, no_update, no_update, no_update
+    healed = {bbl: v for bbl, v in status.items() if bbl not in zombies}
+    # The in-memory queue / batch / job-bbls were already empty (they're not
+    # session-stored), but reset explicitly anyway to keep all four stores
+    # internally consistent.
+    return healed, [], {"started": 0, "done": 0}, []
+
+
+# ── Lookup queue: parallel worker ────────────────────────────────────────
+
+
+MAX_CONCURRENT_LOOKUPS = 5   # how many agent calls may be in flight at once
 
 
 @callback(
@@ -1569,38 +1723,65 @@ def manage_lookup_poll(status):
     prevent_initial_call=True,
 )
 def process_lookup_queue(status, queue, batch):
-    """Serial worker: at most one lookup is in flight at a time. Checks the
-    local cache first — if the result already exists, resolves immediately and
-    fires the toast without calling the agent. Otherwise fires the webhook."""
+    """Parallel worker: keeps up to MAX_CONCURRENT_LOOKUPS agents in flight
+    at once. Each cycle pulls (slots - currently-loading) bbls off the queue,
+    cache-hitting where possible (counts toward done immediately, no slot
+    consumed) and otherwise spawning a background thread."""
     status = dict(status or {})
     queue = list(queue or [])
-    if any((v or {}).get("status") == "loading" for v in status.values()):
+    loading_count = sum(
+        1 for v in status.values() if (v or {}).get("status") == "loading"
+    )
+    slots = MAX_CONCURRENT_LOOKUPS - loading_count
+    if slots <= 0 or not queue:
         return no_update, no_update, no_update, no_update
-    if not queue:
+
+    new_batch = dict(batch or {})
+    new_batch.setdefault("started", 0)
+    new_batch.setdefault("done", 0)
+
+    cache_hits: list[tuple[str, str | None]] = []   # (bbl, address)
+    spawned = 0
+
+    while slots > 0 and queue:
+        next_bbl = queue.pop(0)
+        props = FEATURES_BY_BBL.get(next_bbl)
+        if not props:
+            # Bad bbl — drop from queue but don't consume a slot.
+            continue
+        cached = _fetch_enrichment_result(next_bbl)
+        if cached is not None:
+            address = props.get("address")
+            status[next_bbl] = {"status": "done", "address": address, "data": cached}
+            new_batch["done"] += 1
+            cache_hits.append((next_bbl, address))
+            # Cache hits are synchronous — they don't tie up an in-flight slot.
+            continue
+        entry = dict(status.get(next_bbl) or {})
+        entry["status"]     = "loading"
+        entry["address"]    = entry.get("address") or props.get("address")
+        entry["started_at"] = time.time()
+        status[next_bbl] = entry
+        threading.Thread(
+            target=_run_local_agent, args=(next_bbl, props), daemon=True,
+        ).start()
+        spawned += 1
+        slots -= 1
+
+    if not cache_hits and not spawned:
         return no_update, no_update, no_update, no_update
-    next_bbl = queue.pop(0)
-    props = FEATURES_BY_BBL.get(next_bbl)
-    if not props:
-        return no_update, queue, no_update, no_update
-    # Cache check: if this BBL was already looked up, resolve immediately.
-    cached = _fetch_enrichment_result(next_bbl)
-    if cached is not None:
-        address = props.get("address")
-        status[next_bbl] = {"status": "done", "address": address, "data": cached}
-        toast = {"bbl": next_bbl, "address": address, "more": 0, "tick": time.time()}
-        new_batch = dict(batch or {})
-        new_batch["done"] = new_batch.get("done", 0) + 1
-        new_batch.setdefault("started", 0)
-        return status, queue, toast, new_batch
-    entry = dict(status.get(next_bbl) or {})
-    entry["status"]     = "loading"
-    entry["address"]    = entry.get("address") or props.get("address")
-    entry["started_at"] = time.time()
-    status[next_bbl] = entry
-    threading.Thread(
-        target=_run_local_agent, args=(next_bbl, props), daemon=True,
-    ).start()
-    return status, queue, no_update, no_update
+
+    toast = no_update
+    if cache_hits:
+        last_bbl, last_addr = cache_hits[-1]
+        toast = {
+            "type":    "success",
+            "bbl":     last_bbl,
+            "address": last_addr,
+            "more":    len(cache_hits) - 1,
+            "tick":    time.time(),
+        }
+    return status, queue, toast, new_batch
 
 
 @callback(
@@ -1686,8 +1867,9 @@ _JOB_TRACKER_BODY_HIDDEN = {"display": "none"}
     Input("job-bbls", "data"),
     Input("lookup-status", "data"),
     Input("job-tracker-minimized", "data"),
+    Input("agent-log-poll", "n_intervals"),
 )
-def render_job_tracker(batch, job_bbls, lookup_status, minimized):
+def render_job_tracker(batch, job_bbls, lookup_status, minimized, _poll_tick):
     job_bbls = job_bbls or []
     started  = (batch or {}).get("started", 0)
     done     = (batch or {}).get("done", 0)
@@ -1714,15 +1896,38 @@ def render_job_tracker(batch, job_bbls, lookup_status, minimized):
             pct,
         )
 
-    # Expanded — build a status card per property in the original queue order.
+    # Expanded — bucket cards into Running / Completed / Queued sections, in
+    # that order, preserving the original queue order within each bucket. The
+    # currently-loading cards each get an inline log panel underneath.
     status_map = lookup_status or {}
-    cards = []
+    running: list[tuple[str, dict, str]]   = []   # status == loading
+    completed: list[tuple[str, dict, str]] = []   # status in (done, timeout)
+    queued: list[tuple[str, dict, str]]    = []   # everything else (queued/idle)
     for bbl in job_bbls:
         props = FEATURES_BY_BBL.get(bbl)
         if not props:
             continue
         st = (status_map.get(bbl) or {}).get("status", "idle")
-        cards.append(_job_tracker_card(props, bbl, st))
+        if st == "loading":
+            running.append((bbl, props, st))
+        elif st in ("done", "timeout"):
+            completed.append((bbl, props, st))
+        else:
+            queued.append((bbl, props, st))
+
+    cards: list = []
+    for label, items in (
+        ("Running",   running),
+        ("Completed", completed),
+        ("Queued",    queued),
+    ):
+        if not items:
+            continue
+        cards.append(_job_tracker_section_header(label, len(items)))
+        for bbl, props, st in items:
+            cards.append(_job_tracker_card(props, bbl, st))
+            if st == "loading":
+                cards.append(_inline_log_panel(bbl))
     return (
         _JOB_TRACKER_EXPANDED_STYLE,
         _JOB_TRACKER_BODY_VISIBLE,
@@ -1731,6 +1936,20 @@ def render_job_tracker(batch, job_bbls, lookup_status, minimized):
         "◀",
         pct,
     )
+
+
+@callback(
+    Output("agent-log-poll", "disabled"),
+    Input("lookup-status", "data"),
+)
+def manage_agent_log_poll(lookup_status):
+    # Tail the on-disk log only while at least one bbl is loading — otherwise
+    # nothing's being appended and the poll is pure waste.
+    has_loading = any(
+        (v or {}).get("status") == "loading"
+        for v in (lookup_status or {}).values()
+    )
+    return not has_loading
 
 
 @callback(
@@ -1811,14 +2030,26 @@ def show_lookup_toast(payload, lookup_status):
     addr = payload.get("address") or payload["bbl"]
 
     if payload.get("type") == "error":
-        detail = (
-            "Request failed"
-            if payload.get("reason") == "error"
-            else "Lookup timed out"
-        )
+        reason = payload.get("reason")
+        if reason == "cloudflare":
+            detail = "ContactOut blocked by Cloudflare"
+        elif reason == "timeout":
+            detail = "Lookup timed out"
+        else:
+            detail = "Request failed"
+        # `cancelled` defaults to True to match the old payload shape (any
+        # failure → cancel) for backward compat with cached toasts. New
+        # payloads from poll_lookups set it explicitly.
+        cancelled = payload.get("cancelled", True)
+        if cancelled:
+            tail = " — remaining jobs cancelled."
+        else:
+            streak = payload.get("streak", 0)
+            limit  = payload.get("limit", 3)
+            tail = f" ({streak}/{limit} consecutive timeouts — queue still running)"
         msg = html.Div([
             html.Div(addr, className="small fw-bold mb-1"),
-            html.Div(f"{detail} — remaining jobs cancelled.", className="small text-danger"),
+            html.Div(f"{detail}{tail}", className="small text-danger"),
         ])
         return True, "Lookup failed", "danger", msg
 
@@ -1881,14 +2112,13 @@ def toggle_settings_modal(n, is_open):
 # ── Discovered owners ────────────────────────────────────────────────────
 
 
-def _all_discovered_owners(lookup_status):
-    done_bids = []
-    for bbl, v in (lookup_status or {}).items():
-        if (v or {}).get("status") == "done":
-            props = FEATURES_BY_BBL.get(bbl)
-            if props:
-                done_bids.append(props["id"])
-    return _group_owners_from_buildings(done_bids, lookup_status)
+def _all_discovered_owners(_lookup_status=None):
+    """Every primary landlord we've ever stored, across all sessions. Sourced
+    from the SQLite cache so a fresh app boot still surfaces past discoveries.
+    The argument is intentionally unused — callers pass `lookup_status` so
+    Dash re-triggers this when a new lookup completes."""
+    del _lookup_status   # silence "unused" hint; only here to drive re-renders
+    return agent_cache.get_discovered_owners()
 
 
 _ALL_OWNERS_PAGE = 10
@@ -1929,6 +2159,19 @@ def _owner_card(o):
         },
     )
     row_children = [content_div]
+    if (coowner_count := o.get("coowner_count") or 0) > 0:
+        row_children.append(
+            dbc.Button(
+                f"Co · {coowner_count}",
+                id={"type": "all-owner-coowners-btn", "id": o.get("owner_key")},
+                size="sm",
+                color="info",
+                outline=True,
+                n_clicks=0,
+                style={"fontSize": "10px", "padding": "1px 5px", "flexShrink": "0"},
+                title="Show co-owners on shared buildings",
+            )
+        )
     if has_email:
         row_children.append(
             dbc.Button(
@@ -1947,6 +2190,71 @@ def _owner_card(o):
     )
 
 
+def _coowner_row(co: dict):
+    """Compact sub-row under an expanded owner card. Indented + blue accent
+    so it's visually subordinate to its primary owner."""
+    name = co.get("name") or "(unnamed)"
+    contact_bits = [b for b in [co.get("email"), co.get("phone")] if b]
+    shared = co.get("shared_bbls") or []
+    return html.Div(
+        [
+            html.Small(name, className="fw-semibold d-block",
+                       style={"fontSize": "10px"}),
+            html.Small(
+                " · ".join(contact_bits),
+                className="text-info d-block",
+                style={"fontSize": "9px"},
+            ) if contact_bits else None,
+            html.Small(
+                f"shared on {len(shared)} building{'s' if len(shared) != 1 else ''}",
+                className="text-secondary d-block",
+                style={"fontSize": "9px"},
+            ) if shared else None,
+        ],
+        className="mb-1 p-1 rounded",
+        style={
+            "background": "#161628",
+            "marginLeft": "12px",
+            "borderLeft": "2px solid #4fc3f7",
+            "paddingLeft": "6px",
+        },
+    )
+
+
+def _owner_subsection_header(label: str, count: int, color_cls: str):
+    return html.Div(
+        f"{label} · {count}",
+        className=f"small fw-bold {color_cls} mb-1 mt-2",
+        style={
+            "fontSize": "10px",
+            "textTransform": "uppercase",
+            "letterSpacing": "0.04em",
+            "paddingBottom": "2px",
+            "borderBottom": "1px solid #2a2a4a",
+        },
+    )
+
+
+def _owner_card_with_coowners(o: dict, coowners_expanded: set[str]):
+    """Render an owner card plus, if the user has expanded it, the inline
+    list of co-owners pulled lazily from the DB."""
+    card = _owner_card(o)
+    if o.get("owner_key") not in coowners_expanded:
+        return [card]
+    co_list = agent_cache.get_coowners(o.get("name") or "")
+    if not co_list:
+        return [card, html.Div(
+            "(no co-owners on shared buildings)",
+            className="small text-secondary",
+            style={
+                "fontSize": "9px", "marginLeft": "12px",
+                "paddingLeft": "6px", "borderLeft": "2px solid #4fc3f7",
+                "marginBottom": "4px",
+            },
+        )]
+    return [card] + [_coowner_row(co) for co in co_list]
+
+
 @callback(
     Output("all-owners-items", "children"),
     Output("all-owners-count", "children"),
@@ -1954,20 +2262,69 @@ def _owner_card(o):
     Output("all-owners-toggle-btn", "style"),
     Input("lookup-status", "data"),
     Input("all-owners-expanded", "data"),
+    Input("coowners-expanded-keys", "data"),
 )
-def render_all_owners(lookup_status, expanded):
+def render_all_owners(lookup_status, expanded, coowners_expanded_keys):
     owners = _all_discovered_owners(lookup_status)
     total = len(owners)
     btn_hidden = {"fontSize": "10px", "display": "none"}
     btn_visible = {"fontSize": "10px", "display": "inline-block"}
     if not owners:
         return html.P("No lookups yet.", className="small text-secondary"), "", "", btn_hidden
-    displayed = owners if expanded else owners[:_ALL_OWNERS_PAGE]
-    items = [_owner_card(o) for o in displayed]
-    if total <= _ALL_OWNERS_PAGE:
+
+    # Split by contact reachability. Owners we have an email for are far more
+    # useful (clickable + shortlistable + email-blastable) so they sit first.
+    with_email    = [o for o in owners if o.get("email")]
+    without_email = [o for o in owners if not o.get("email")]
+
+    if expanded:
+        we_show, ne_show = with_email, without_email
+    else:
+        we_show, ne_show = with_email[:_ALL_OWNERS_PAGE], without_email[:_ALL_OWNERS_PAGE]
+
+    coowners_expanded = set(coowners_expanded_keys or [])
+
+    items: list = []
+    if with_email:
+        items.append(_owner_subsection_header("Email found", len(with_email), "text-success"))
+        for o in we_show:
+            items.extend(_owner_card_with_coowners(o, coowners_expanded))
+    if without_email:
+        items.append(_owner_subsection_header("No email found", len(without_email), "text-secondary"))
+        for o in ne_show:
+            items.extend(_owner_card_with_coowners(o, coowners_expanded))
+
+    # Show the "Show all" toggle only when at least one section is truncated.
+    truncated = (not expanded) and (
+        len(with_email) > _ALL_OWNERS_PAGE or len(without_email) > _ALL_OWNERS_PAGE
+    )
+    if not truncated and not expanded:
         return items, str(total), "", btn_hidden
     btn_label = "Hide" if expanded else f"Show all ({total})"
     return items, str(total), btn_label, btn_visible
+
+
+@callback(
+    Output("coowners-expanded-keys", "data"),
+    Input({"type": "all-owner-coowners-btn", "id": ALL}, "n_clicks"),
+    State("coowners-expanded-keys", "data"),
+    prevent_initial_call=True,
+)
+def toggle_coowners(clicks, current):
+    trig = ctx.triggered_id
+    if not isinstance(trig, dict) or trig.get("type") != "all-owner-coowners-btn":
+        return no_update
+    # Pattern-matched inputs occasionally fire on re-render with no real
+    # n_clicks; require at least one actual click.
+    if not any(c for c in (clicks or []) if c):
+        return no_update
+    key = trig.get("id")
+    expanded = list(current or [])
+    if key in expanded:
+        expanded.remove(key)
+    else:
+        expanded.append(key)
+    return expanded
 
 
 @callback(
@@ -2624,17 +2981,6 @@ if __name__ == "__main__":
     )
     parser.add_argument("--port", type=int, default=8050)
     parser.add_argument("--debug", action="store_true", default=True)
-    parser.add_argument(
-        "--agent-debug",
-        action="store_true",
-        help="Print verbose logs for every agent invocation: per-message SDK "
-             "events, the CLI subprocess's stderr, and tracebacks on failure. "
-             "Off by default — only what app.py would normally surface.",
-    )
     args = parser.parse_args()
     AGENT_HEADED = args.headed
-    AGENT_DEBUG  = args.agent_debug
-    if AGENT_DEBUG:
-        _ensure_agent_debug_handler()
-        agent_debug_log("[agent] debug mode enabled — logging to .agent_debug.log")
     app.run(debug=args.debug, port=args.port)
