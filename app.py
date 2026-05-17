@@ -1,3 +1,4 @@
+import argparse
 import math
 import os
 import json
@@ -10,7 +11,6 @@ from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 
 import pandas as pd
-import requests
 import dash
 from dash import dcc, html, Input, Output, State, callback, ALL, ctx, no_update
 import dash_leaflet as dl
@@ -18,15 +18,21 @@ import dash_bootstrap_components as dbc
 from dash_extensions.javascript import assign
 from dotenv import load_dotenv
 
+import agent_cache
+from agent_runner import (
+    debug_log as agent_debug_log,
+    run_landlord_lookup,
+    _ensure_debug_handler as _ensure_agent_debug_handler,
+)
+from agent_to_storage import translate as translate_agent_result
+
 load_dotenv()
+agent_cache.init_db()
 
-AGENT_WEBHOOK_URL   = os.getenv("AGENT_WEBHOOK_URL", "").rstrip("/") or None
-CALLBACK_PUBLIC_URL = os.getenv("CALLBACK_PUBLIC_URL", "").rstrip("/") or None
-CALLBACK_LOCAL_URL  = os.getenv("CALLBACK_LOCAL_URL", "http://localhost:9000").rstrip("/")
-SHARED_SECRET       = os.getenv("SHARED_SECRET") or None
-
-LOOKUP_TIMEOUT_SECONDS = 90    # 90-second per-request budget before we move on
-_LOOKUP_ERRORS: dict = {}      # bbl -> True; written by webhook thread on request failure
+LOOKUP_TIMEOUT_SECONDS = 240   # local agent runs (WoW + multi-owner ContactOut) take ~1–3 min
+_LOOKUP_ERRORS: dict = {}      # bbl -> True; written by agent worker thread on failure
+AGENT_HEADED = False           # set by --headed at startup; surfaces the browser the agent drives
+AGENT_DEBUG  = False           # set by --agent-debug; prints CLI stderr + SDK messages per call
 
 # ── Data loading ───────────────────────────────────────────────────────────
 BASE_DIR = Path(__file__).parent
@@ -526,42 +532,98 @@ BUILDING_DETAIL_MODAL = dbc.Modal(
     size="md",
 )
 
-TASK_PROGRESS_BAR = html.Div(
-    id="task-progress-bar",
+JOB_TRACKER_WIDTH = 300         # expanded panel width
+JOB_TRACKER_MIN_WIDTH = 36      # minimized strip width (chevron only)
+SIDEBAR_WIDTH_PX = 280          # must match SIDEBAR's width style
+
+# Slides in absolutely-positioned to the LEFT of the sidebar when a job is
+# active. Minimizable to a thin chevron strip via `job-tracker-toggle-btn`.
+JOB_TRACKER = html.Div(
+    id="job-tracker",
     style={
-        "width": "100%",
-        "padding": "8px 16px",
+        "position": "absolute",
+        "right": f"{SIDEBAR_WIDTH_PX}px",
+        "top": "0",
+        "bottom": "0",
+        "width": f"{JOB_TRACKER_WIDTH}px",
         "background": "rgba(18,18,42,0.97)",
-        "borderBottom": "1px solid #2a2a4a",
-        "display": "none",
-        "flexShrink": "0",
+        "borderLeft": "1px solid #2a2a4a",
+        "borderRight": "1px solid #2a2a4a",
+        "boxShadow": "-4px 0 12px rgba(0,0,0,0.4)",
+        "zIndex": 500,
+        "display": "none",   # render_job_tracker shows it once a job starts
+        "flexDirection": "column",
     },
     children=[
+        # Always-visible chevron header.
         html.Div(
-            [
-                html.Div(id="task-progress-label", className="small text-secondary"),
-                dbc.Button(
-                    "Cancel queued",
-                    id="cancel-queue-btn",
-                    size="sm",
-                    color="danger",
-                    outline=True,
-                    n_clicks=0,
+            dbc.Button(
+                "◀",
+                id="job-tracker-toggle-btn",
+                size="sm",
+                color="secondary",
+                outline=True,
+                n_clicks=0,
+                style={"fontSize": "11px", "padding": "1px 8px", "minWidth": "28px"},
+                title="Minimize / expand",
+            ),
+            className="d-flex justify-content-end p-1",
+            style={"borderBottom": "1px solid #2a2a4a", "flexShrink": "0"},
+        ),
+        # Expanded-only body — hidden when the panel is collapsed.
+        html.Div(
+            id="job-tracker-body",
+            style={
+                "flex": "1",
+                "display": "flex",
+                "flexDirection": "column",
+                "minHeight": "0",
+            },
+            children=[
+                html.Div(
+                    [
+                        html.Span(
+                            id="job-tracker-count",
+                            className="small text-secondary",
+                        ),
+                        dbc.Button(
+                            "Cancel queued",
+                            id="cancel-queue-btn",
+                            size="sm",
+                            color="danger",
+                            outline=True,
+                            n_clicks=0,
+                            style={
+                                "fontSize": "10px",
+                                "padding": "1px 8px",
+                                "display": "none",
+                            },
+                        ),
+                    ],
+                    className="d-flex justify-content-between align-items-center px-2 py-1",
+                    style={"flexShrink": "0"},
+                ),
+                dbc.Progress(
+                    id="task-progress-fill",
+                    value=0,
+                    striped=True,
+                    animated=True,
                     style={
-                        "fontSize": "10px",
-                        "padding": "1px 8px",
-                        "display": "none",
+                        "height": "4px",
+                        "borderRadius": "0",
+                        "flexShrink": "0",
+                    },
+                ),
+                html.Div(
+                    id="job-tracker-items",
+                    style={
+                        "flex": "1",
+                        "overflowY": "auto",
+                        "padding": "8px",
+                        "minHeight": "0",
                     },
                 ),
             ],
-            className="d-flex justify-content-between align-items-center mb-1",
-        ),
-        dbc.Progress(
-            id="task-progress-fill",
-            value=0,
-            striped=True,
-            animated=True,
-            style={"height": "8px"},
         ),
     ],
 )
@@ -670,6 +732,8 @@ app.layout = html.Div(
         dcc.Store(id="task-batch", data={"started": 0, "done": 0}),
         dcc.Store(id="selected-buildings", storage_type="session", data=[]),
         dcc.Store(id="lookup-queue", data=[]),
+        dcc.Store(id="job-bbls", data=[]),
+        dcc.Store(id="job-tracker-minimized", data=False),
         dcc.Store(id="all-owners-expanded", data=False),
         dcc.Interval(id="sel-poll", interval=150, n_intervals=0),
         dcc.Interval(
@@ -685,10 +749,12 @@ app.layout = html.Div(
             disabled=True,
         ),
         NAVBAR,
-        TASK_PROGRESS_BAR,
         html.Div(
-            [MAP_AREA, SIDEBAR],
-            style={"display": "flex", "flex": "1", "minHeight": "0", "overflow": "hidden"},
+            [MAP_AREA, JOB_TRACKER, SIDEBAR],
+            style={
+                "display": "flex", "flex": "1", "minHeight": "0",
+                "overflow": "hidden", "position": "relative",
+            },
         ),
         EMAIL_MODAL,
         BUILDING_DETAIL_MODAL,
@@ -742,6 +808,25 @@ def _lookup_button(bbl: str, status: str):
         # Clickable so user can re-queue.
         return dbc.Button("⚠ Retry", color="warning", **common)
     return dbc.Button("Lookup", color="primary", outline=True, **common)
+
+
+def _job_tracker_card(props, bbl: str, status: str):
+    """Compact card for a building inside the job tracker. Mirrors the look of
+    a `_selected_cards` row (dark background + border, address text, status
+    button) but without the deselect (×) action — you can't drop a building
+    out of an already-in-flight job."""
+    return html.Div(
+        [
+            html.Div(
+                props["address"],
+                className="small text-truncate flex-grow-1",
+                style={"minWidth": 0},
+            ),
+            _lookup_button(bbl, status),
+        ],
+        className="mb-1 p-2 rounded d-flex align-items-center gap-2",
+        style={"background": "#1a1a2e", "border": "1px solid #2a2a4a"},
+    )
 
 
 def _selected_cards(building_ids, lookup_status=None):
@@ -833,15 +918,20 @@ def render_selected_list(selected_ids, lookup_status):
     return cards, count_label, actions_style
 
 
+SUBWAY_STOPS_MIN_ZOOM = 14   # hide the station markers below this zoom; lines stay
+
+
 @callback(
     Output("subway-layer", "data"),
     Output("subway-routes-layer", "data"),
     Input("subway-toggle", "value"),
+    Input("main-map", "zoom"),
 )
-def toggle_subway(show):
-    if show:
-        return SUBWAY_GEOJSON, ROUTES_GEOJSON
-    return EMPTY_GEOJSON, EMPTY_GEOJSON
+def toggle_subway(show, zoom):
+    if not show:
+        return EMPTY_GEOJSON, EMPTY_GEOJSON
+    stops = SUBWAY_GEOJSON if (zoom or 0) >= SUBWAY_STOPS_MIN_ZOOM else EMPTY_GEOJSON
+    return stops, ROUTES_GEOJSON
 
 
 @callback(
@@ -908,7 +998,10 @@ def _owner_key(name):
 def _group_owners_from_buildings(building_ids, lookup_status):
     """Walk building_ids → for each looked-up building, take the primary
     landlord → group into {owner_key: {name, phone, email, office, role,
-    buildings: [{bbl, address}, ...]}}. Returns a list sorted by name."""
+    fetched_at, buildings: [{bbl, address}, ...]}}. Returns a list sorted by
+    descending fetched_at (most-recently-fetched owner first), with name as
+    a tiebreaker."""
+    fetched_at_by_name = agent_cache.get_landlord_fetched_at_by_name()
     grouped = {}
     for bid in building_ids:
         props = FEATURES_BY_ID.get(bid)
@@ -925,13 +1018,14 @@ def _group_owners_from_buildings(building_ids, lookup_status):
         key = _owner_key(owner.get("name"))
         if key not in grouped:
             grouped[key] = {
-                "owner_key": key,
-                "name":      owner.get("name"),
-                "phone":     owner.get("phone"),
-                "email":     owner.get("email") or owner.get("email_inferred"),
-                "office":    owner.get("office") or owner.get("company"),
-                "role":      owner.get("role"),
-                "buildings": [],
+                "owner_key":  key,
+                "name":       owner.get("name"),
+                "phone":      owner.get("phone"),
+                "email":      owner.get("email") or owner.get("email_inferred"),
+                "office":     owner.get("office") or owner.get("company"),
+                "role":       owner.get("role"),
+                "fetched_at": fetched_at_by_name.get(key, 0),
+                "buildings":  [],
             }
         if not any(b["bbl"] == bbl for b in grouped[key]["buildings"]):
             grouped[key]["buildings"].append({
@@ -941,48 +1035,51 @@ def _group_owners_from_buildings(building_ids, lookup_status):
                 "block":   props.get("block"),
                 "lot":     props.get("lot"),
             })
-    return sorted(grouped.values(), key=lambda o: (o.get("name") or "").lower())
+    return sorted(
+        grouped.values(),
+        key=lambda o: (-(o.get("fetched_at") or 0), (o.get("name") or "").lower()),
+    )
 
 
-def _fire_enrichment_webhook(correlation_id: str, props: dict) -> None:
-    """POST a job to the kiloclaw webhook. Fire-and-forget; runs in a thread
-    so the Dash callback returns immediately."""
-    if not AGENT_WEBHOOK_URL or not CALLBACK_PUBLIC_URL or not SHARED_SECRET:
-        return
-    payload = {
-        "correlation_id": correlation_id,
-        "bbl":     _bbl_for(props) or None,
-        "address": props.get("address"),
-        "zip":     props.get("zip"),
-        "block":   props.get("block"),
-        "lot":     props.get("lot"),
-        "callback_url":  f"{CALLBACK_PUBLIC_URL}/agent-result",
-        "shared_secret": SHARED_SECRET,
-    }
+def _run_local_agent(bbl: str, props: dict) -> None:
+    """Run the local landlord-lookup agent for `props['address']` and persist
+    the translated result to the SQLite cache. Fire-and-forget; runs in a
+    thread so the Dash callback returns immediately. On any exception the
+    bbl is flagged in _LOOKUP_ERRORS so the polling callback surfaces a
+    timeout/error toast."""
+    address = props.get("address")
+    if AGENT_DEBUG:
+        agent_debug_log(f"[agent] start bbl={bbl} address={address!r}")
     try:
-        requests.post(f"{AGENT_WEBHOOK_URL}", json=payload, timeout=8)
+        if not address:
+            if AGENT_DEBUG:
+                agent_debug_log(f"[agent] abort bbl={bbl}: no address on props")
+            _LOOKUP_ERRORS[bbl] = True
+            return
+        agent_json = run_landlord_lookup(address, headed=AGENT_HEADED, debug=AGENT_DEBUG)
+        if not isinstance(agent_json, dict):
+            if AGENT_DEBUG:
+                agent_debug_log(
+                    f"[agent] fail bbl={bbl}: runner returned {type(agent_json).__name__} "
+                    f"(expected dict): {agent_json!r}"
+                )
+            _LOOKUP_ERRORS[bbl] = True
+            return
+        flat = translate_agent_result(agent_json, props)
+        agent_cache.store_result(bbl, flat)
+        if AGENT_DEBUG:
+            agent_debug_log(f"[agent] done bbl={bbl}")
     except Exception:
-        _LOOKUP_ERRORS[correlation_id] = True
+        if AGENT_DEBUG:
+            import traceback
+            agent_debug_log(f"[agent] exception bbl={bbl}:\n{traceback.format_exc()}")
+        _LOOKUP_ERRORS[bbl] = True
 
 
 def _fetch_enrichment_result(building_id: str):
-    """Returns the agent's data dict if ready, None if still pending."""
-    if not SHARED_SECRET:
-        return None
-    try:
-        r = requests.get(
-            f"{CALLBACK_LOCAL_URL}/result/{building_id}",
-            headers={"Authorization": f"Bearer {SHARED_SECRET}"},
-            timeout=4,
-        )
-        if r.status_code != 200:
-            return None
-        body = r.json()
-        if body.get("status") == "ready":
-            return body.get("data")
-    except Exception:
-        return None
-    return None
+    """Returns the cached agent result dict if present, None if not yet
+    written. Reads directly from the SQLite cache; no HTTP roundtrip."""
+    return agent_cache.get_cached_result(building_id)
 
 
 STAT_FIELDS = [
@@ -1001,19 +1098,17 @@ STAT_FIELDS = [
     ("Matched building",         "matched_building"),
 ]
 
-# Top-level metadata keys the modal already shows in the Building section,
-# plus anything that must never be displayed (echoed-back auth, internal IDs).
+# Top-level metadata keys the modal already shows in the Building section.
 INTERNAL_FIELDS = {
     "address", "bbl", "block", "lot", "zip",
-    "correlation_id", "building_address", "search_address",
-    "shared_secret",
+    "building_address", "search_address",
+    "source", "wow_url",
 }
 
-NAMED_DICT_SECTIONS = [
-    ("Recommended outreach", "recommended_outreach", False),
-    ("Portfolio",            "portfolio",            False),
-    ("Useful links",         "useful_links",         True),
-]
+# Dict-shaped fields the modal renders as bulleted name/value blocks.
+# The legacy agent emitted recommended_outreach/useful_links; the local agent
+# doesn't, so this list is empty for now (kept for future expansion).
+NAMED_DICT_SECTIONS: list[tuple[str, str, bool]] = []
 
 
 def _render_dict_rows(d, as_links=False):
@@ -1152,13 +1247,6 @@ def _render_owner_section(stored):
         )
         sections.extend(_entity_cards(landlords))
 
-    entities = data.get("corporate_entities")
-    if isinstance(entities, list) and entities:
-        sections.append(
-            html.Div("Corporate entities", className="small fw-bold mt-2 mb-1")
-        )
-        sections.extend(_entity_cards(entities))
-
     for label, key, as_links in NAMED_DICT_SECTIONS:
         v = data.get(key)
         if isinstance(v, dict) and v:
@@ -1169,7 +1257,7 @@ def _render_owner_section(stored):
 
     handled = (
         {f[1] for f in STAT_FIELDS}
-        | {"flags", "landlords", "corporate_entities"}
+        | {"flags", "landlords", "portfolio"}
         | {k for _, k, _ in NAMED_DICT_SECTIONS}
     )
     remaining = {
@@ -1333,52 +1421,62 @@ def _queue_lookup_for_bbl(bbl, status, batch, queue):
     Output("lookup-status", "data"),
     Output("task-batch", "data"),
     Output("lookup-queue", "data"),
+    Output("job-bbls", "data"),
     Input({"type": "lookup-btn", "id": ALL}, "n_clicks"),
     State("lookup-status", "data"),
     State("task-batch", "data"),
     State("lookup-queue", "data"),
+    State("job-bbls", "data"),
     prevent_initial_call=True,
 )
-def start_lookup(n_clicks_list, status, batch, queue):
+def start_lookup(n_clicks_list, status, batch, queue, job_bbls):
     if not any(n for n in (n_clicks_list or []) if n):
-        return no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update
     trig = ctx.triggered_id
     if not trig or trig.get("type") != "lookup-btn":
-        return no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update
     new_status, new_batch, new_queue = _queue_lookup_for_bbl(
         trig["id"], status or {}, batch or {}, queue or []
     )
     if new_status is None:
-        return no_update, no_update, no_update
-    return new_status, new_batch, new_queue
+        return no_update, no_update, no_update, no_update
+    bbls = list(job_bbls or [])
+    if trig["id"] not in bbls:
+        bbls.append(trig["id"])
+    return new_status, new_batch, new_queue, bbls
 
 
 @callback(
     Output("lookup-status", "data", allow_duplicate=True),
     Output("task-batch", "data", allow_duplicate=True),
     Output("lookup-queue", "data", allow_duplicate=True),
+    Output("job-bbls", "data", allow_duplicate=True),
     Input("modal-lookup-btn", "n_clicks"),
     State("modal-building-id", "data"),
     State("lookup-status", "data"),
     State("task-batch", "data"),
     State("lookup-queue", "data"),
+    State("job-bbls", "data"),
     prevent_initial_call=True,
 )
-def start_lookup_from_modal(n, building_id, status, batch, queue):
+def start_lookup_from_modal(n, building_id, status, batch, queue, job_bbls):
     if not n or not building_id:
-        return no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update
     props = FEATURES_BY_ID.get(building_id)
     if not props:
-        return no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update
     bbl = _bbl_for(props)
     if not bbl:
-        return no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update
     new_status, new_batch, new_queue = _queue_lookup_for_bbl(
         bbl, status or {}, batch or {}, queue or []
     )
     if new_status is None:
-        return no_update, no_update, no_update
-    return new_status, new_batch, new_queue
+        return no_update, no_update, no_update, no_update
+    bbls = list(job_bbls or [])
+    if bbl not in bbls:
+        bbls.append(bbl)
+    return new_status, new_batch, new_queue, bbls
 
 
 @callback(
@@ -1500,7 +1598,7 @@ def process_lookup_queue(status, queue, batch):
     entry["started_at"] = time.time()
     status[next_bbl] = entry
     threading.Thread(
-        target=_fire_enrichment_webhook, args=(next_bbl, props), daemon=True,
+        target=_run_local_agent, args=(next_bbl, props), daemon=True,
     ).start()
     return status, queue, no_update, no_update
 
@@ -1509,27 +1607,30 @@ def process_lookup_queue(status, queue, batch):
     Output("lookup-queue", "data", allow_duplicate=True),
     Output("lookup-status", "data", allow_duplicate=True),
     Output("task-batch", "data", allow_duplicate=True),
+    Output("job-bbls", "data", allow_duplicate=True),
     Input("cancel-queue-btn", "n_clicks"),
     State("lookup-status", "data"),
     State("task-batch", "data"),
     State("lookup-queue", "data"),
+    State("job-bbls", "data"),
     prevent_initial_call=True,
 )
-def cancel_queue(n, status, batch, queue):
+def cancel_queue(n, status, batch, queue, job_bbls):
     if not n:
-        return no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update
     status = dict(status or {})
-    cancelled = 0
+    cancelled_bbls: set[str] = set()
     for bbl in list(status.keys()):
         if (status.get(bbl) or {}).get("status") == "queued":
             del status[bbl]
-            cancelled += 1
-    if cancelled == 0 and not queue:
-        return no_update, no_update, no_update
+            cancelled_bbls.add(bbl)
+    if not cancelled_bbls and not queue:
+        return no_update, no_update, no_update, no_update
     new_batch = dict(batch or {})
-    new_batch["started"] = max(0, new_batch.get("started", 0) - cancelled)
+    new_batch["started"] = max(0, new_batch.get("started", 0) - len(cancelled_bbls))
     new_batch.setdefault("done", 0)
-    return [], status, new_batch
+    bbls = [b for b in (job_bbls or []) if b not in cancelled_bbls]
+    return [], status, new_batch, bbls
 
 
 @callback(
@@ -1542,35 +1643,106 @@ def manage_cancel_btn(queue):
     return {"fontSize": "10px", "padding": "1px 8px", "display": "none"}
 
 
-# ── Task progress bar ────────────────────────────────────────────────────
+# ── Job tracker panel ────────────────────────────────────────────────────
 
 
-_TASK_BAR_HIDDEN_STYLE = {"display": "none"}
-_TASK_BAR_VISIBLE_STYLE = {
-    "width": "100%",
-    "padding": "8px 16px",
+_JOB_TRACKER_BASE_STYLE = {
+    "position": "absolute",
+    "right": f"{SIDEBAR_WIDTH_PX}px",
+    "top": "0",
+    "bottom": "0",
     "background": "rgba(18,18,42,0.97)",
-    "borderBottom": "1px solid #2a2a4a",
-    "display": "block",
-    "flexShrink": "0",
+    "borderLeft": "1px solid #2a2a4a",
+    "borderRight": "1px solid #2a2a4a",
+    "boxShadow": "-4px 0 12px rgba(0,0,0,0.4)",
+    "zIndex": 500,
+    "flexDirection": "column",
 }
+_JOB_TRACKER_HIDDEN_STYLE = {**_JOB_TRACKER_BASE_STYLE, "display": "none"}
+_JOB_TRACKER_EXPANDED_STYLE = {
+    **_JOB_TRACKER_BASE_STYLE,
+    "display": "flex",
+    "width": f"{JOB_TRACKER_WIDTH}px",
+}
+_JOB_TRACKER_MINIMIZED_STYLE = {
+    **_JOB_TRACKER_BASE_STYLE,
+    "display": "flex",
+    "width": f"{JOB_TRACKER_MIN_WIDTH}px",
+}
+_JOB_TRACKER_BODY_VISIBLE = {
+    "flex": "1", "display": "flex", "flexDirection": "column", "minHeight": "0",
+}
+_JOB_TRACKER_BODY_HIDDEN = {"display": "none"}
 
 
 @callback(
-    Output("task-progress-bar", "style"),
-    Output("task-progress-label", "children"),
+    Output("job-tracker", "style"),
+    Output("job-tracker-body", "style"),
+    Output("job-tracker-count", "children"),
+    Output("job-tracker-items", "children"),
+    Output("job-tracker-toggle-btn", "children"),
     Output("task-progress-fill", "value"),
     Input("task-batch", "data"),
+    Input("job-bbls", "data"),
+    Input("lookup-status", "data"),
+    Input("job-tracker-minimized", "data"),
 )
-def render_task_progress(batch):
-    started = (batch or {}).get("started", 0)
-    done    = (batch or {}).get("done", 0)
-    if started <= 0:
-        return _TASK_BAR_HIDDEN_STYLE, no_update, no_update
+def render_job_tracker(batch, job_bbls, lookup_status, minimized):
+    job_bbls = job_bbls or []
+    started  = (batch or {}).get("started", 0)
+    done     = (batch or {}).get("done", 0)
     pct = int(100 * done / started) if started else 0
+
+    # No active or recently-completed job → hide panel entirely.
+    if not job_bbls and started <= 0:
+        return (
+            _JOB_TRACKER_HIDDEN_STYLE,
+            no_update, no_update, no_update, no_update, no_update,
+        )
+
     word = "lookup" if started == 1 else "lookups"
-    label = f"{done} / {started} owner {word} complete"
-    return _TASK_BAR_VISIBLE_STYLE, label, pct
+    count_text = f"{done} / {started} {word} complete"
+
+    if minimized:
+        # Show only the chevron; body collapsed; skip card rendering.
+        return (
+            _JOB_TRACKER_MINIMIZED_STYLE,
+            _JOB_TRACKER_BODY_HIDDEN,
+            count_text,
+            [],
+            "▶",
+            pct,
+        )
+
+    # Expanded — build a status card per property in the original queue order.
+    status_map = lookup_status or {}
+    cards = []
+    for bbl in job_bbls:
+        props = FEATURES_BY_BBL.get(bbl)
+        if not props:
+            continue
+        st = (status_map.get(bbl) or {}).get("status", "idle")
+        cards.append(_job_tracker_card(props, bbl, st))
+    return (
+        _JOB_TRACKER_EXPANDED_STYLE,
+        _JOB_TRACKER_BODY_VISIBLE,
+        count_text,
+        cards,
+        "◀",
+        pct,
+    )
+
+
+@callback(
+    Output("job-tracker-minimized", "data"),
+    Input("job-tracker-toggle-btn", "n_clicks"),
+    State("job-tracker-minimized", "data"),
+    prevent_initial_call=True,
+)
+def toggle_job_tracker_minimize(n, minimized):
+    if not n:
+        return no_update
+    return not minimized
 
 
 @callback(
@@ -1589,11 +1761,12 @@ def manage_task_cleanup(batch):
 @callback(
     Output("task-batch", "data", allow_duplicate=True),
     Output("task-cleanup", "disabled", allow_duplicate=True),
+    Output("job-bbls", "data", allow_duplicate=True),
     Input("task-cleanup", "n_intervals"),
     prevent_initial_call=True,
 )
 def reset_task_batch(_n):
-    return {"started": 0, "done": 0}, True
+    return {"started": 0, "done": 0}, True, []
 
 
 # ── Modal "Lookup Owner" button visibility ───────────────────────────────
@@ -1735,20 +1908,27 @@ def _owner_card(o):
                        style={"fontSize": "10px"})
         )
     contact_bits = [b for b in [o.get("phone"), o.get("email")] if b]
-    row_children = [
-        html.Div(
-            [
-                html.Small(o.get("name") or "(unnamed)",
-                           className="fw-semibold d-block",
-                           style={"fontSize": "11px"}),
-                *building_lines,
-                html.Small(" · ".join(contact_bits),
-                           className="text-info d-block",
-                           style={"fontSize": "10px"}) if contact_bits else None,
-            ],
-            style={"flex": "1", "minWidth": 0, "overflow": "hidden"},
-        ),
-    ]
+    # Clickable content area — clicking it selects every property this owner
+    # holds. Kept as a sibling (not parent) of the Shortlist button so the
+    # button's click doesn't bubble up and trigger selection.
+    content_div = html.Div(
+        [
+            html.Small(o.get("name") or "(unnamed)",
+                       className="fw-semibold d-block",
+                       style={"fontSize": "11px"}),
+            *building_lines,
+            html.Small(" · ".join(contact_bits),
+                       className="text-info d-block",
+                       style={"fontSize": "10px"}) if contact_bits else None,
+        ],
+        id={"type": "all-owner-row", "id": o.get("owner_key")},
+        n_clicks=0,
+        style={
+            "flex": "1", "minWidth": 0, "overflow": "hidden",
+            "cursor": "pointer",
+        },
+    )
+    row_children = [content_div]
     if has_email:
         row_children.append(
             dbc.Button(
@@ -1813,10 +1993,15 @@ def toggle_all_owners(n, expanded):
     Input("radius-slider", "value"),
     Input("clear-selection-btn", "n_clicks"),
     Input({"type": "deselect-btn", "id": ALL}, "n_clicks"),
+    Input({"type": "all-owner-row", "id": ALL}, "n_clicks"),
     State("selected-buildings", "data"),
+    State("lookup-status", "data"),
     prevent_initial_call=True,
 )
-def update_selection(click_data, bbox, subway_sel, radius_km, _clear, _deselects, current):
+def update_selection(
+    click_data, bbox, subway_sel, radius_km, _clear, _deselects,
+    owner_clicks, current, lookup_status,
+):
     trig = ctx.triggered_id
     current = list(current or [])
 
@@ -1828,6 +2013,26 @@ def update_selection(click_data, bbox, subway_sel, radius_km, _clear, _deselects
     if isinstance(trig, dict) and trig.get("type") == "deselect-btn":
         bid = trig.get("id")
         return [x for x in current if x != bid], no_update, no_update
+
+    # Click on an owner row in the discovered-owners list: REPLACE selection
+    # with every building that owner is the primary landlord of. Guard against
+    # the spurious initial-render click pattern-matched inputs sometimes fire
+    # with no real n_clicks.
+    if isinstance(trig, dict) and trig.get("type") == "all-owner-row":
+        if not any(c for c in (owner_clicks or []) if c):
+            return no_update, no_update, no_update
+        owners = _all_discovered_owners(lookup_status)
+        owner = next(
+            (o for o in owners if o.get("owner_key") == trig.get("id")), None
+        )
+        if not owner:
+            return no_update, no_update, no_update
+        bids = []
+        for b in owner.get("buildings", []):
+            props = FEATURES_BY_BBL.get(b["bbl"])
+            if props:
+                bids.append(props["id"])
+        return bids, None, None
 
     # BBox drag committed: REPLACE selection with buildings in bbox.
     # BBox cleared by JS background-click reset (bbox=None): clear selection.
@@ -1891,19 +2096,22 @@ def highlight_selected(selected_ids):
     Output("lookup-status", "data", allow_duplicate=True),
     Output("task-batch", "data", allow_duplicate=True),
     Output("lookup-queue", "data", allow_duplicate=True),
+    Output("job-bbls", "data", allow_duplicate=True),
     Input("bulk-lookup-btn", "n_clicks"),
     State("selected-buildings", "data"),
     State("lookup-status", "data"),
     State("task-batch", "data"),
     State("lookup-queue", "data"),
+    State("job-bbls", "data"),
     prevent_initial_call=True,
 )
-def bulk_lookup_selected(n, selected_ids, status, batch, queue):
+def bulk_lookup_selected(n, selected_ids, status, batch, queue, job_bbls):
     if not n or not selected_ids:
-        return no_update, no_update, no_update
+        return no_update, no_update, no_update, no_update
     status = dict(status or {})
     batch = dict(batch or {})
     queue = list(queue or [])
+    bbls = list(job_bbls or [])
     added = 0
     for bid in selected_ids:
         props = FEATURES_BY_ID.get(bid)
@@ -1918,10 +2126,12 @@ def bulk_lookup_selected(n, selected_ids, status, batch, queue):
         status = new_status
         batch  = new_batch
         queue  = new_queue
+        if bbl not in bbls:
+            bbls.append(bbl)
         added += 1
     if added == 0:
-        return no_update, no_update, no_update
-    return status, batch, queue
+        return no_update, no_update, no_update, no_update
+    return status, batch, queue, bbls
 
 
 # ── Owner shortlist ─────────────────────────────────────────────────────
@@ -2405,4 +2615,26 @@ def _interpolate(template: str, variables: dict) -> str:
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=8050)
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--headed",
+        action="store_true",
+        help="Run the landlord-lookup agent's browser visibly (headless=false). "
+             "Useful for demos or debugging. Defaults to headless.",
+    )
+    parser.add_argument("--port", type=int, default=8050)
+    parser.add_argument("--debug", action="store_true", default=True)
+    parser.add_argument(
+        "--agent-debug",
+        action="store_true",
+        help="Print verbose logs for every agent invocation: per-message SDK "
+             "events, the CLI subprocess's stderr, and tracebacks on failure. "
+             "Off by default — only what app.py would normally surface.",
+    )
+    args = parser.parse_args()
+    AGENT_HEADED = args.headed
+    AGENT_DEBUG  = args.agent_debug
+    if AGENT_DEBUG:
+        _ensure_agent_debug_handler()
+        agent_debug_log("[agent] debug mode enabled — logging to .agent_debug.log")
+    app.run(debug=args.debug, port=args.port)
