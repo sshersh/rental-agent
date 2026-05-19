@@ -1,0 +1,10 @@
+AGGREGATE across 10 runs  total work=18m53s
+  whoownswhat_lookup          █████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    2m34s  (13.6%)  avg/run 15.4s
+  contactout_query            █████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    2m11s  (11.6%)  avg/run 13.1s
+  contactout_open             ██░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    56.0s  ( 4.9%)  avg/run 5.6s
+  contactout_apply_filters    █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    42.0s  ( 3.7%)  avg/run 4.2s
+  contactout_reveal_and_read  █░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    38.0s  ( 3.4%)  avg/run 3.8s
+  contactout_close            ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░     3.0s  ( 0.3%)  avg/run 0.3s
+  Skill                       ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░     0.0s  ( 0.0%)  avg/run 0.0s
+  ToolSearch                  ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░     0.0s  ( 0.0%)  avg/run 0.0s
+  model (thinking+gen)        █████████████████████████░░░░░░░░░░░░░░░   11m49s  (62.6%)  avg/run 1m10s

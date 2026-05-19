@@ -27,7 +27,7 @@ load_dotenv()
 agent_cache.init_db()
 
 LOOKUP_TIMEOUT_SECONDS = 240   # local agent runs (WoW + multi-owner ContactOut) take ~1–3 min
-_LOOKUP_ERRORS: dict = {}      # bbl -> reason str ("error" | "cloudflare"); written by agent worker thread on failure
+_LOOKUP_ERRORS: dict = {}      # bbl -> {"reason": str, "detail": str} or legacy reason str; written by agent worker thread on failure
 AGENT_HEADED = False           # set by --headed at startup; surfaces the browser the agent drives
 
 # ── Data loading ───────────────────────────────────────────────────────────
@@ -528,7 +528,7 @@ BUILDING_DETAIL_MODAL = dbc.Modal(
     size="md",
 )
 
-JOB_TRACKER_WIDTH = 300         # expanded panel width
+JOB_TRACKER_WIDTH = 600         # expanded panel width
 JOB_TRACKER_MIN_WIDTH = 36      # minimized strip width (chevron only)
 SIDEBAR_WIDTH_PX = 280          # must match SIDEBAR's width style
 
@@ -837,36 +837,84 @@ def _job_tracker_card(props, bbl: str, status: str):
     )
 
 
-# Matches the `[tool] name=... input={...}` lines that agent_runner emits per
-# tool use. Groups: ts (date+time), tool_name, input_json.
-_TOOL_LOG_LINE_RE = re.compile(
-    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[tool\] name=(\S+) input=(.*)$"
+# Matches any structured log line agent_runner emits — tool calls, model
+# thinking, assistant prose, user-side text, and tool results. The first
+# group is the timestamp; the second is the bracketed event tag; the third
+# is the rest of the line.
+_STRUCTURED_LOG_RE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[(tool|tool_result|thinking|assistant|user|runner)\] (.*)$"
 )
 
+# Renders the model line (`[runner] model=<id>`) once at the top of the
+# inline panel — the rest of the [runner] lines are runner bookkeeping
+# (start/done/lock waits) that aren't useful inline.
+_RUNNER_MODEL_RE = re.compile(r"^model=(\S+)$")
 
-def _recent_tool_calls(bbl: str, n: int = 5) -> list[str]:
-    """Read `.agent_logs/<bbl>.log`, filter for `[tool]` lines, format each as
-    `HH:MM:SS  short_tool_name(arg1='value', arg2='value')`, and return the
-    most-recent `n`. Returns [] if no tool calls yet (or no log file)."""
+
+def _recent_agent_events(bbl: str, n: int = 5) -> list[str]:
+    """Read ``.agent_logs/<bbl>.log`` and format the most recent ``n``
+    structured events for the inline log panel.
+
+    Each entry comes back as ``HH:MM:SS  <prefix>  <payload>``:
+
+      * ``tool   contactout_query(name='Joel Silberstein')``
+      * ``→      <tool result, truncated to ~200 chars>``
+      * ``think  <model thinking, truncated>``
+      * ``say    <assistant prose>``
+      * ``user   <user text>``
+      * ``model  claude-haiku-4-5-20251001`` (first-line marker only)
+    """
     log = agent_runner.read_log(bbl)
     if not log:
         return []
-    formatted = []
+
+    formatted: list[str] = []
     for line in log.splitlines():
-        m = _TOOL_LOG_LINE_RE.match(line)
+        m = _STRUCTURED_LOG_RE.match(line)
         if not m:
             continue
-        ts, full_name, input_json = m.groups()
-        # Drop the long `mcp__landlord__` prefix; show just the tool's name.
-        short = full_name.rsplit("__", 1)[-1]
-        try:
-            args = json.loads(input_json)
-            args_text = ", ".join(f"{k}={v!r}" for k, v in args.items())
-        except Exception:
-            args_text = input_json
+        ts, kind, payload = m.groups()
         time_only = ts.split(" ", 1)[1]
-        formatted.append(f"{time_only}  {short}({args_text})")
+
+        if kind == "tool":
+            # [tool] name=<full> input=<json>
+            tm = re.match(r"name=(\S+) input=(.*)", payload)
+            if not tm:
+                continue
+            full_name, input_json = tm.groups()
+            short = full_name.rsplit("__", 1)[-1]
+            try:
+                args = json.loads(input_json)
+                args_text = ", ".join(f"{k}={v!r}" for k, v in args.items())
+            except Exception:
+                args_text = input_json
+            formatted.append(f"{time_only}  tool   {short}({args_text})")
+
+        elif kind == "tool_result":
+            formatted.append(f"{time_only}  →      {payload[:200]}")
+
+        elif kind == "thinking":
+            formatted.append(f"{time_only}  think  {payload[:200]}")
+
+        elif kind == "assistant":
+            formatted.append(f"{time_only}  say    {payload[:200]}")
+
+        elif kind == "user":
+            formatted.append(f"{time_only}  user   {payload[:200]}")
+
+        elif kind == "runner":
+            mm = _RUNNER_MODEL_RE.match(payload)
+            if mm:
+                formatted.append(f"{time_only}  model  {mm.group(1)}")
+            # All other [runner] lines (start/done/lock) are skipped here —
+            # they're surfaced by the main tracker UI state, not the inline log.
+
     return formatted[-n:]
+
+
+# Backwards compat: the old name is still used by the panel; thin alias keeps
+# the rename non-breaking if any other module still imports it.
+_recent_tool_calls = _recent_agent_events
 
 
 def _job_tracker_section_header(label: str, count: int):
@@ -887,11 +935,11 @@ def _job_tracker_section_header(label: str, count: int):
 
 def _inline_log_panel(bbl: str):
     """The small auto-scrolling log block that renders directly under the
-    currently-loading card. Capped at 5 entries — `_recent_tool_calls`
+    currently-loading card. Capped at 5 entries — `_recent_agent_events`
     already returns the trailing 5; CSS height also clamps it so the panel
     can't push other cards off-screen."""
-    lines = _recent_tool_calls(bbl, n=5)
-    text = "\n".join(lines) if lines else "(waiting for first tool call…)"
+    lines = _recent_agent_events(bbl, n=5)
+    text = "\n".join(lines) if lines else "(waiting for first agent event…)"
     return html.Pre(
         text,
         className="mb-2 p-2 rounded",
@@ -903,13 +951,14 @@ def _inline_log_panel(bbl: str):
             "color": "#b8b8d0",
             "fontFamily": "ui-monospace, SFMono-Regular, monospace",
             "fontSize": "10px",
-            # One log entry per line — no wrapping. Horizontal scroll kicks in
-            # when an entry (e.g. a long tool arg) exceeds the panel width.
-            "whiteSpace": "pre",
+            # Long entries wrap so they flow vertically instead of clipping
+            # horizontally — the panel scrolls down for older lines.
+            "whiteSpace": "pre-wrap",
+            "wordBreak": "break-word",
             "margin": "-4px 0 8px 0",  # snug under the card above it
-            "maxHeight": "110px",
+            "maxHeight": "260px",
             "overflowY": "auto",
-            "overflowX": "auto",
+            "overflowX": "hidden",
         },
     )
 
@@ -1109,6 +1158,7 @@ def _group_owners_from_buildings(building_ids, lookup_status):
                 "email":      owner.get("email") or owner.get("email_inferred"),
                 "office":     owner.get("office") or owner.get("company"),
                 "role":       owner.get("role"),
+                "occupation": owner.get("occupation"),
                 "fetched_at": fetched_at_by_name.get(key, 0),
                 "buildings":  [],
             }
@@ -1150,11 +1200,12 @@ def _run_local_agent(bbl: str, props: dict) -> None:
         flat = translate_agent_result(agent_json, props)
         agent_cache.store_result(bbl, flat)
         agent_runner.write_log(bbl, "[worker] stored result, done")
-    except agent_runner.ContactOutCloudflareError:
+    except agent_runner.ContactOutCloudflareError as e:
         agent_runner.write_log(
-            bbl, "[worker] ContactOut blocked by Cloudflare; surfacing error"
+            bbl,
+            f"[worker] ContactOut blocked ({e.reason}); surfacing error: {e}",
         )
-        _LOOKUP_ERRORS[bbl] = "cloudflare"
+        _LOOKUP_ERRORS[bbl] = {"reason": e.reason, "detail": str(e)}
     except Exception:
         import traceback
         agent_runner.write_log(
@@ -1593,11 +1644,16 @@ def poll_lookups(_n, status, batch, queue, timeout_streak):
     failed = []   # (bbl, address, reason) — "timeout" or "error"
     now = time.time()
     for bbl, v in loading:
-        err_reason = _LOOKUP_ERRORS.pop(bbl, None)
-        if err_reason:
-            reason = err_reason if isinstance(err_reason, str) else "error"
+        err = _LOOKUP_ERRORS.pop(bbl, None)
+        if err:
+            if isinstance(err, dict):
+                reason = err.get("reason") or "error"
+                detail = err.get("detail") or ""
+            else:
+                reason = err if isinstance(err, str) else "error"
+                detail = ""
             status[bbl] = {"status": "timeout", "address": v.get("address")}
-            failed.append((bbl, v.get("address") or bbl, reason))
+            failed.append((bbl, v.get("address") or bbl, reason, detail))
             continue
         data = _fetch_enrichment_result(bbl)
         if data is not None:
@@ -1607,7 +1663,7 @@ def poll_lookups(_n, status, batch, queue, timeout_streak):
         started_at = v.get("started_at") or now
         if now - started_at > LOOKUP_TIMEOUT_SECONDS:
             status[bbl] = {"status": "timeout", "address": v.get("address"), "started_at": started_at}
-            failed.append((bbl, v.get("address") or bbl, "timeout"))
+            failed.append((bbl, v.get("address") or bbl, "timeout", ""))
     if not completed and not failed:
         return no_update, no_update, no_update, no_update, no_update
 
@@ -1620,8 +1676,8 @@ def poll_lookups(_n, status, batch, queue, timeout_streak):
     # immediately — they indicate a systemic problem, not a slow agent.
     # Timeouts accumulate; any successful completion in this tick breaks the
     # streak.
-    timeouts_now = sum(1 for _, _, r in failed if r == "timeout")
-    errors_now   = sum(1 for _, _, r in failed if r != "timeout")
+    timeouts_now = sum(1 for _, _, r, _ in failed if r == "timeout")
+    errors_now   = sum(1 for _, _, r, _ in failed if r != "timeout")
     streak = 0 if completed else int(timeout_streak or 0)
     streak += timeouts_now
     cancel_queue = errors_now > 0 or streak >= TIMEOUT_STREAK_LIMIT
@@ -1638,10 +1694,11 @@ def poll_lookups(_n, status, batch, queue, timeout_streak):
         streak = 0   # fresh slate once the queue is drained
 
     if failed:
-        last_bbl, last_addr, reason = failed[-1]
+        last_bbl, last_addr, reason, detail = failed[-1]
         toast = {
             "type":      "error",
             "reason":    reason,
+            "detail":    detail,
             "bbl":       last_bbl,
             "address":   last_addr,
             "cancelled": cancel_queue,
@@ -1709,7 +1766,7 @@ def heal_zombie_lookup_state(n, status):
 # ── Lookup queue: parallel worker ────────────────────────────────────────
 
 
-MAX_CONCURRENT_LOOKUPS = 5   # how many agent calls may be in flight at once
+MAX_CONCURRENT_LOOKUPS = 1   # how many agent calls may be in flight at once
 
 
 @callback(
@@ -2031,8 +2088,16 @@ def show_lookup_toast(payload, lookup_status):
 
     if payload.get("type") == "error":
         reason = payload.get("reason")
-        if reason == "cloudflare":
+        # Prefer the specific error string returned by the agent_runner (e.g.
+        # "ContactOut blocked: Rate limited (Too Many Requests)") when we have
+        # it; fall back to a generic per-reason label otherwise.
+        raw_detail = (payload.get("detail") or "").strip()
+        if raw_detail:
+            detail = raw_detail
+        elif reason == "cloudflare":
             detail = "ContactOut blocked by Cloudflare"
+        elif reason == "blocked":
+            detail = "ContactOut blocked"
         elif reason == "timeout":
             detail = "Lookup timed out"
         else:
@@ -2141,11 +2206,26 @@ def _owner_card(o):
     # Clickable content area — clicking it selects every property this owner
     # holds. Kept as a sibling (not parent) of the Shortlist button so the
     # button's click doesn't bubble up and trigger selection.
+    occupation = (o.get("occupation") or "").strip()
+    name_row = [html.Small(o.get("name") or "(unnamed)",
+                           className="fw-semibold",
+                           style={"fontSize": "11px"})]
+    if occupation:
+        name_row.append(
+            html.Small(
+                occupation,
+                className="text-warning ms-1",
+                style={
+                    "fontSize": "9px",
+                    "fontStyle": "italic",
+                    "textTransform": "lowercase",
+                },
+                title="Occupation (from ContactOut profile)",
+            )
+        )
     content_div = html.Div(
         [
-            html.Small(o.get("name") or "(unnamed)",
-                       className="fw-semibold d-block",
-                       style={"fontSize": "11px"}),
+            html.Div(name_row, className="d-flex align-items-baseline gap-1"),
             *building_lines,
             html.Small(" · ".join(contact_bits),
                        className="text-info d-block",
