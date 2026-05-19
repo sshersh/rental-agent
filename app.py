@@ -18,6 +18,8 @@ import dash_bootstrap_components as dbc
 from dash_extensions.javascript import assign
 from dotenv import load_dotenv
 
+from anthropic import Anthropic
+
 import agent_cache
 import agent_runner
 from agent_runner import run_landlord_lookup
@@ -25,6 +27,48 @@ from agent_to_storage import translate as translate_agent_result
 
 load_dotenv()
 agent_cache.init_db()
+
+AVAILABLE_TEMPLATE_VARS = [
+    "owner_name", "address", "addresses", "property_label", "building_count",
+    "zip", "block", "lot", "office", "phone", "sender_name", "sender_email",
+]
+
+_NAME_ACRONYMS = {
+    "LLC", "LP", "LLP", "PC", "PLLC", "INC", "INC.", "CORP", "CORP.",
+    "LTD", "LTD.", "II", "III", "IV", "V", "NYC", "USA", "NY", "PA",
+    "&", "AND", "DBA", "MGMT", "MGMT.",
+}
+
+
+def _format_owner_name(name: str) -> str:
+    """Title-case all-caps/all-lower names while preserving acronyms.
+
+    Names from WoW often come UPPERCASED ("ABC REALTY LLC") which makes
+    drafted emails look obviously templated.
+    """
+    if not name:
+        return "there"
+    s = name.strip()
+    if not s:
+        return "there"
+    if not (s.isupper() or s.islower()):
+        return s
+    out = []
+    for w in s.split():
+        if w.upper() in _NAME_ACRONYMS:
+            out.append(w.upper())
+        else:
+            out.append(w[:1].upper() + w[1:].lower())
+    return " ".join(out)
+
+
+def _property_label(buildings: list) -> str:
+    """Subject-friendly label: address for single, generic for portfolio."""
+    n = len(buildings or [])
+    if n <= 1:
+        return (buildings[0].get("address", "") if n else "") or ""
+    return f"your {n} properties"
+
 
 LOOKUP_TIMEOUT_SECONDS = 240   # local agent runs (WoW + multi-owner ContactOut) take ~1–3 min
 _LOOKUP_ERRORS: dict = {}      # bbl -> {"reason": str, "detail": str} or legacy reason str; written by agent worker thread on failure
@@ -34,6 +78,34 @@ AGENT_HEADED = False           # set by --headed at startup; surfaces the browse
 BASE_DIR = Path(__file__).parent
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
+
+
+# ── Server-side last-template persistence ────────────────────────────────
+LAST_TEMPLATE_PATH = DATA_DIR / "last_email_template.json"
+
+
+def _load_last_template() -> dict:
+    try:
+        with open(LAST_TEMPLATE_PATH) as f:
+            data = json.load(f)
+        return {
+            "subject": str(data.get("subject", "")),
+            "body":    str(data.get("body", "")),
+        }
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {"subject": "", "body": ""}
+
+
+def _save_last_template(subject: str, body: str) -> None:
+    try:
+        LAST_TEMPLATE_PATH.write_text(
+            json.dumps({"subject": subject or "", "body": body or ""})
+        )
+    except OSError:
+        pass
+
+
+_LAST_TEMPLATE = _load_last_template()
 
 df = pd.read_csv(BASE_DIR / "bklyn_rent_stabilized_buildings.csv")
 df = df.dropna(subset=["LATITUDE", "LONGITUDE", "BLOCK", "LOT"])
@@ -51,6 +123,12 @@ df["statuses"] = (
 df["zip"] = df["ZIP"].astype(str)
 
 ALL_ZIPS = sorted(df["zip"].unique())
+
+# Initial value for the "Max parallel landlord lookups" slider in the
+# settings modal. The slider persists to localStorage, so the user's choice
+# overrides this on subsequent loads — this just sets the first-load default
+# and the floor when the slider's value is missing.
+DEFAULT_MAX_CONCURRENT_LOOKUPS = 3
 
 ALL_FEATURES = [
     {
@@ -247,7 +325,7 @@ NAVBAR = dbc.Navbar(
     style={"height": "50px", "minHeight": "50px"},
 )
 
-SIDEBAR = html.Div(
+SIDEBAR_SHORTLIST_VIEW = html.Div(
     [
         # ── Selected buildings ─────────────────────────────────────────
         html.Div(
@@ -363,7 +441,7 @@ SIDEBAR = html.Div(
                     children=html.P("No owners yet.", className="small text-secondary"),
                 ),
                 dbc.Button(
-                    "Compose Email →",
+                    "Draft Email →",
                     id="open-email-btn",
                     color="success",
                     size="sm",
@@ -374,11 +452,151 @@ SIDEBAR = html.Div(
             className="p-3",
         ),
     ],
+    id="sidebar-shortlist-view",
+    style={"height": "100%", "overflowY": "auto"},
+)
+
+SIDEBAR_DRAFT_VIEW = html.Div(
+    [
+        # ── Header (fixed) ────────────────────────────────────────────
+        html.Div(
+            [
+                dbc.Button(
+                    "← Back",
+                    id="draft-back-btn",
+                    color="link",
+                    size="sm",
+                    className="p-0 text-secondary",
+                    style={"fontSize": "12px", "textDecoration": "none"},
+                ),
+                html.Span(
+                    "Draft Email",
+                    className="fw-bold ms-2",
+                    style={"fontSize": "13px"},
+                ),
+            ],
+            className="d-flex align-items-center p-3 border-bottom border-secondary",
+            style={"flex": "0 0 auto"},
+        ),
+        # ── Editor + LLM controls (fixed) ─────────────────────────────
+        html.Div(
+            [
+                html.Label("Subject", className="small fw-bold mb-1"),
+                dbc.Input(
+                    id="draft-subject",
+                    type="text",
+                    value=_LAST_TEMPLATE["subject"],
+                    placeholder="Apartment inquiry — {{property_label}}",
+                    size="sm",
+                    className="mb-2",
+                    debounce=True,
+                    persistence=True,
+                    persistence_type="local",
+                ),
+                html.Label("Body", className="small fw-bold mb-1"),
+                dcc.Textarea(
+                    id="draft-body",
+                    value=_LAST_TEMPLATE["body"],
+                    placeholder="Hi {{owner_name}},\n\nI'm looking for a rent-stabilized apartment...",
+                    style={
+                        "width": "100%",
+                        "height": "140px",
+                        "fontFamily": "monospace",
+                        "fontSize": "12px",
+                    },
+                    className="form-control mb-2",
+                    persistence=True,
+                    persistence_type="local",
+                ),
+                html.Div(
+                    [
+                        html.Span("Variables: ", className="text-secondary"),
+                        *[
+                            html.Code(
+                                "{{" + v + "}}",
+                                className="me-1",
+                                style={"fontSize": "10px"},
+                            )
+                            for v in AVAILABLE_TEMPLATE_VARS
+                        ],
+                    ],
+                    className="small mb-2",
+                ),
+                html.Hr(className="my-2"),
+                html.Label(
+                    "Generate / refine with LLM",
+                    className="small fw-bold mb-1",
+                ),
+                dcc.Textarea(
+                    id="draft-prompt",
+                    placeholder="e.g. make it warmer and more concise",
+                    style={
+                        "width": "100%",
+                        "height": "50px",
+                        "fontSize": "12px",
+                    },
+                    className="form-control mb-2",
+                ),
+                dbc.Button(
+                    "Generate",
+                    id="draft-llm-btn",
+                    color="primary",
+                    size="sm",
+                    className="w-100 mb-1",
+                ),
+                html.Div(
+                    id="draft-llm-status",
+                    className="small text-danger",
+                    style={"fontSize": "11px"},
+                ),
+            ],
+            className="px-3 pt-3 pb-2 border-bottom border-secondary",
+            style={"flex": "0 0 auto"},
+        ),
+        # ── Previews label (fixed) ────────────────────────────────────
+        html.Div(
+            "Filled previews (per owner)",
+            className="fw-bold small px-3 pt-2 pb-1",
+            style={"flex": "0 0 auto"},
+        ),
+        # ── Previews scroll area (flex-grow + scroll) ─────────────────
+        html.Div(
+            id="draft-previews",
+            children=html.P(
+                "Add owners to shortlist to see previews.",
+                className="small text-secondary",
+            ),
+            style={
+                "flex": "1 1 auto",
+                "overflowY": "auto",
+                "minHeight": "0",
+                "padding": "0 1rem",
+            },
+        ),
+        # ── Send button footer (fixed) ────────────────────────────────
+        html.Div(
+            dbc.Button(
+                "Send (coming soon)",
+                id="draft-send-btn",
+                color="danger",
+                size="sm",
+                className="w-100",
+                disabled=True,
+            ),
+            className="p-3 border-top border-secondary",
+            style={"flex": "0 0 auto"},
+        ),
+    ],
+    id="sidebar-draft-view",
+    style={"display": "none"},
+)
+
+SIDEBAR = html.Div(
+    [SIDEBAR_SHORTLIST_VIEW, SIDEBAR_DRAFT_VIEW],
     style={
-        "width": "280px",
+        "width": "400px",
         "flexShrink": "0",
         "height": "100%",
-        "overflowY": "auto",
         "background": "#12122a",
         "borderLeft": "1px solid #222",
     },
@@ -428,68 +646,6 @@ MAP_AREA = dl.Map(
             onEachFeature=zip_tooltip_fn,
         ),
     ],
-)
-
-EMAIL_MODAL = dbc.Modal(
-    [
-        dbc.ModalHeader(dbc.ModalTitle("Email Blast")),
-        dbc.ModalBody(
-            [
-                html.P(
-                    [
-                        "Template variables: ",
-                        html.Code("{owner_name}"),
-                        ", ",
-                        html.Code("{address}"),
-                        ", ",
-                        html.Code("{addresses}"),
-                        ", ",
-                        html.Code("{building_count}"),
-                        ", ",
-                        html.Code("{zip}"),
-                        ", ",
-                        html.Code("{sender_email}"),
-                    ],
-                    className="small text-secondary mb-2",
-                ),
-                dcc.Textarea(
-                    id="email-template",
-                    value=(
-                        "Hi {owner_name},\n\n"
-                        "I'm looking for a rent-stabilized apartment and came across "
-                        "your building at {address}.\n\n"
-                        "Is anything currently available across your {building_count} "
-                        "property/properties ({addresses}), or could you let me know "
-                        "when something opens up?\n\n"
-                        "Feel free to reply to {sender_email}.\n\n"
-                        "Thank you,"
-                    ),
-                    style={
-                        "width": "100%",
-                        "height": "160px",
-                        "fontFamily": "monospace",
-                        "fontSize": "13px",
-                    },
-                    className="form-control mb-3",
-                ),
-                html.H6("Recipients", className="mt-2"),
-                html.Small(
-                    "Enter owner emails below — only buildings with an email will be sent.",
-                    className="text-secondary",
-                ),
-                html.Div(id="email-previews", className="mt-3"),
-                html.Hr(),
-                dbc.Button(
-                    "Send Blast", id="send-btn", color="danger", className="w-100 mt-1"
-                ),
-                html.Div(id="send-status", className="mt-2"),
-            ]
-        ),
-    ],
-    id="email-modal",
-    size="xl",
-    is_open=False,
-    scrollable=True,
 )
 
 BUILDING_DETAIL_MODAL = dbc.Modal(
@@ -686,7 +842,11 @@ SETTINGS_MODAL = dbc.Modal(
                     id="radius-control",
                     children=[
                         html.Hr(className="my-2"),
-                        html.Div(id="radius-label", className="small text-info mb-1"),
+                        html.Div(
+                            id="radius-label",
+                            className="small text-info mb-1",
+                            children="Subway-stop radius (click a stop to use)",
+                        ),
                         dcc.Slider(
                             id="radius-slider",
                             min=0.25,
@@ -698,7 +858,32 @@ SETTINGS_MODAL = dbc.Modal(
                         ),
                         html.Div("km radius", className="small text-secondary text-center"),
                     ],
-                    style={"display": "none"},
+                ),
+                html.Hr(className="my-3"),
+                html.Div(
+                    "Lookups",
+                    className="text-uppercase text-secondary fw-bold small mb-2",
+                    style={"letterSpacing": "0.08em"},
+                ),
+                html.Div(
+                    "Max parallel landlord lookups",
+                    className="small text-info mb-1",
+                ),
+                dbc.Input(
+                    id="max-parallel-input",
+                    type="number",
+                    min=1,
+                    max=20,
+                    step=1,
+                    value=DEFAULT_MAX_CONCURRENT_LOOKUPS,
+                    persistence=True,
+                    persistence_type="local",
+                    style={"maxWidth": "120px"},
+                ),
+                html.Div(
+                    "Agents share one Chromium window and one ContactOut page; "
+                    "they serialize at the page but reason in parallel.",
+                    className="small text-secondary mt-1",
                 ),
             ]
         ),
@@ -720,6 +905,8 @@ app.layout = html.Div(
     style={"display": "flex", "flexDirection": "column", "height": "100vh", "overflow": "hidden"},
     children=[
         dcc.Store(id="shortlist-store", storage_type="local"),
+        dcc.Store(id="sidebar-mode-store", storage_type="session", data="shortlist"),
+        dcc.Store(id="llm-status-store", data=None),
         dcc.Store(id="bbox-store", data=None),
         dcc.Store(id="subway-selection-store", data=None),
         dcc.Store(id="modal-building-id", data=None),
@@ -765,7 +952,6 @@ app.layout = html.Div(
                 "overflow": "hidden", "position": "relative",
             },
         ),
-        EMAIL_MODAL,
         BUILDING_DETAIL_MODAL,
         SETTINGS_MODAL,
         LOOKUP_TOAST,
@@ -851,24 +1037,19 @@ _STRUCTURED_LOG_RE = re.compile(
 _RUNNER_MODEL_RE = re.compile(r"^model=(\S+)$")
 
 
-def _recent_agent_events(bbl: str, n: int = 5) -> list[str]:
-    """Read ``.agent_logs/<bbl>.log`` and format the most recent ``n``
-    structured events for the inline log panel.
+def _recent_agent_events(bbl: str, n: int = 5) -> list[tuple[str, str, str]]:
+    """Read ``.agent_logs/<bbl>.log`` and return the most recent ``n``
+    structured events as ``(time, kind_label, payload)`` tuples — the inline
+    log panel renders each piece with its own color.
 
-    Each entry comes back as ``HH:MM:SS  <prefix>  <payload>``:
-
-      * ``tool   contactout_query(name='Joel Silberstein')``
-      * ``→      <tool result, truncated to ~200 chars>``
-      * ``think  <model thinking, truncated>``
-      * ``say    <assistant prose>``
-      * ``user   <user text>``
-      * ``model  claude-haiku-4-5-20251001`` (first-line marker only)
+    ``kind_label`` is one of: ``tool``, ``→`` (tool_result), ``think``,
+    ``say``, ``user``, ``model``.
     """
     log = agent_runner.read_log(bbl)
     if not log:
         return []
 
-    formatted: list[str] = []
+    events: list[tuple[str, str, str]] = []
     for line in log.splitlines():
         m = _STRUCTURED_LOG_RE.match(line)
         if not m:
@@ -888,33 +1069,28 @@ def _recent_agent_events(bbl: str, n: int = 5) -> list[str]:
                 args_text = ", ".join(f"{k}={v!r}" for k, v in args.items())
             except Exception:
                 args_text = input_json
-            formatted.append(f"{time_only}  tool   {short}({args_text})")
+            events.append((time_only, "tool", f"{short}({args_text})"))
 
         elif kind == "tool_result":
-            formatted.append(f"{time_only}  →      {payload[:200]}")
+            events.append((time_only, "→", payload[:200]))
 
         elif kind == "thinking":
-            formatted.append(f"{time_only}  think  {payload[:200]}")
+            events.append((time_only, "think", payload[:200]))
 
         elif kind == "assistant":
-            formatted.append(f"{time_only}  say    {payload[:200]}")
+            events.append((time_only, "say", payload[:200]))
 
         elif kind == "user":
-            formatted.append(f"{time_only}  user   {payload[:200]}")
+            events.append((time_only, "user", payload[:200]))
 
         elif kind == "runner":
             mm = _RUNNER_MODEL_RE.match(payload)
             if mm:
-                formatted.append(f"{time_only}  model  {mm.group(1)}")
+                events.append((time_only, "model", mm.group(1)))
             # All other [runner] lines (start/done/lock) are skipped here —
             # they're surfaced by the main tracker UI state, not the inline log.
 
-    return formatted[-n:]
-
-
-# Backwards compat: the old name is still used by the panel; thin alias keeps
-# the rename non-breaking if any other module still imports it.
-_recent_tool_calls = _recent_agent_events
+    return events[-n:]
 
 
 def _job_tracker_section_header(label: str, count: int):
@@ -933,15 +1109,38 @@ def _job_tracker_section_header(label: str, count: int):
     )
 
 
+_LOG_TS_COLOR = "#7aa2f7"     # blue — timestamp
+_LOG_KIND_COLOR = "#e0af68"   # yellow — message-type label
+
+
 def _inline_log_panel(bbl: str):
     """The small auto-scrolling log block that renders directly under the
     currently-loading card. Capped at 5 entries — `_recent_agent_events`
     already returns the trailing 5; CSS height also clamps it so the panel
-    can't push other cards off-screen."""
-    lines = _recent_agent_events(bbl, n=5)
-    text = "\n".join(lines) if lines else "(waiting for first agent event…)"
+    can't push other cards off-screen.
+
+    Each line is rendered as three colored spans (timestamp blue, kind
+    label yellow, payload default) so the eye can jump straight to the
+    event type."""
+    events = _recent_agent_events(bbl, n=5)
+    if not events:
+        children: list = ["(waiting for first agent event…)"]
+    else:
+        children = []
+        for i, (ts, kind, payload) in enumerate(events):
+            if i > 0:
+                children.append("\n")
+            children.append(html.Span(ts, style={"color": _LOG_TS_COLOR}))
+            children.append("  ")
+            # Pad to 6 chars so payloads align across rows regardless of which
+            # kind label this is ("tool", "→", "think", "say", "user", "model").
+            children.append(
+                html.Span(f"{kind:<6}", style={"color": _LOG_KIND_COLOR})
+            )
+            children.append("  ")
+            children.append(payload)
     return html.Pre(
-        text,
+        children,
         className="mb-2 p-2 rounded",
         style={
             "background": "#0d0d1f",
@@ -1766,9 +1965,6 @@ def heal_zombie_lookup_state(n, status):
 # ── Lookup queue: parallel worker ────────────────────────────────────────
 
 
-MAX_CONCURRENT_LOOKUPS = 1   # how many agent calls may be in flight at once
-
-
 @callback(
     Output("lookup-status", "data", allow_duplicate=True),
     Output("lookup-queue", "data", allow_duplicate=True),
@@ -1777,11 +1973,14 @@ MAX_CONCURRENT_LOOKUPS = 1   # how many agent calls may be in flight at once
     Input("lookup-status", "data"),
     Input("lookup-queue", "data"),
     State("task-batch", "data"),
+    State("max-parallel-input", "value"),
     prevent_initial_call=True,
 )
-def process_lookup_queue(status, queue, batch):
-    """Parallel worker: keeps up to MAX_CONCURRENT_LOOKUPS agents in flight
-    at once. Each cycle pulls (slots - currently-loading) bbls off the queue,
+def process_lookup_queue(status, queue, batch, max_parallel):
+    """Parallel worker: keeps up to `max_parallel` agents in flight at once,
+    where `max_parallel` comes from the slider in the settings modal (with
+    DEFAULT_MAX_CONCURRENT_LOOKUPS as fallback before the slider hydrates).
+    Each cycle pulls (slots - currently-loading) bbls off the queue,
     cache-hitting where possible (counts toward done immediately, no slot
     consumed) and otherwise spawning a background thread."""
     status = dict(status or {})
@@ -1789,7 +1988,8 @@ def process_lookup_queue(status, queue, batch):
     loading_count = sum(
         1 for v in status.values() if (v or {}).get("status") == "loading"
     )
-    slots = MAX_CONCURRENT_LOOKUPS - loading_count
+    cap = int(max_parallel) if max_parallel else DEFAULT_MAX_CONCURRENT_LOOKUPS
+    slots = cap - loading_count
     if slots <= 0 or not queue:
         return no_update, no_update, no_update, no_update
 
@@ -2694,39 +2894,79 @@ def remove_owner_from_shortlist(n_clicks_list, shortlist):
 
 
 @callback(
-    Output("email-modal", "is_open"),
+    Output("sidebar-mode-store", "data", allow_duplicate=True),
     Input("open-email-btn", "n_clicks"),
-    State("email-modal", "is_open"),
     prevent_initial_call=True,
 )
-def toggle_modal(n, is_open):
-    return not is_open if n else is_open
+def enter_draft_mode(_n):
+    return "draft"
 
 
 @callback(
-    Output("email-previews", "children"),
-    Input("shortlist-store", "data"),
-    Input("email-template", "value"),
+    Output("sidebar-mode-store", "data", allow_duplicate=True),
+    Input("draft-back-btn", "n_clicks"),
+    prevent_initial_call=True,
 )
-def render_previews(shortlist, template):
+def exit_draft_mode(_n):
+    return "shortlist"
+
+
+@callback(
+    Output("sidebar-shortlist-view", "style"),
+    Output("sidebar-draft-view", "style"),
+    Input("sidebar-mode-store", "data"),
+)
+def render_sidebar_mode(mode):
+    shortlist_show = {"display": "block", "height": "100%", "overflowY": "auto"}
+    shortlist_hide = {"display": "none"}
+    draft_show = {"display": "flex", "flexDirection": "column", "height": "100%"}
+    draft_hide = {"display": "none"}
+    if mode == "draft":
+        return shortlist_hide, draft_show
+    return shortlist_show, draft_hide
+
+
+@callback(
+    Output("draft-llm-btn", "children"),
+    Input("draft-body", "value"),
+)
+def llm_button_label(body):
+    return "Refine" if (body or "").strip() else "Generate"
+
+
+@callback(
+    Output("draft-previews", "children"),
+    Input("shortlist-store", "data"),
+    Input("draft-subject", "value"),
+    Input("draft-body", "value"),
+)
+def render_previews(shortlist, subject, body):
     if not shortlist:
-        return html.P("No owners in shortlist.", className="small text-secondary")
+        return html.P(
+            "Add owners to shortlist to see previews.",
+            className="small text-secondary",
+        )
     items = []
     for o in shortlist:
         bs = o.get("buildings", [])
         addresses_str = "; ".join(b["address"] for b in bs)
         first = bs[0] if bs else {}
         ctx_vars = {
-            "owner_name":    o.get("name") or "there",
+            "owner_name":    _format_owner_name(o.get("name") or ""),
             "address":       first.get("address", ""),
             "addresses":     addresses_str,
+            "property_label": _property_label(bs),
             "building_count": len(bs),
             "zip":           first.get("zip", ""),
             "block":         first.get("block", ""),
             "lot":           first.get("lot", ""),
-            "sender_email":  "(your email)",
+            "office":        o.get("office", "") or "",
+            "phone":         o.get("phone", "") or "",
+            "sender_name":   os.getenv("SENDER_NAME", "Sam Shersher"),
+            "sender_email":  os.getenv("EMAIL_USER", "(your email)"),
         }
-        preview = _interpolate(template or "", ctx_vars)
+        subject_preview = _interpolate(subject or "", ctx_vars)
+        body_preview = _interpolate(body or "", ctx_vars)
         items.append(
             dbc.Card(
                 [
@@ -2753,10 +2993,24 @@ def render_previews(shortlist, template):
                         ]
                     ),
                     dbc.CardBody(
-                        html.Pre(
-                            preview,
-                            style={"fontSize": "11px", "whiteSpace": "pre-wrap", "marginBottom": 0},
-                        )
+                        [
+                            html.Div(
+                                [
+                                    html.Span("Subject: ", className="fw-bold"),
+                                    html.Span(subject_preview or html.Em("(empty)")),
+                                ],
+                                className="small mb-2",
+                                style={"fontSize": "11px"},
+                            ),
+                            html.Pre(
+                                body_preview,
+                                style={
+                                    "fontSize": "11px",
+                                    "whiteSpace": "pre-wrap",
+                                    "marginBottom": 0,
+                                },
+                            ),
+                        ]
                     ),
                 ],
                 className="mb-2",
@@ -2764,6 +3018,37 @@ def render_previews(shortlist, template):
             )
         )
     return items
+
+
+@callback(
+    Output("draft-subject", "value"),
+    Output("draft-body", "value"),
+    Output("llm-status-store", "data"),
+    Input("draft-llm-btn", "n_clicks"),
+    State("draft-prompt", "value"),
+    State("draft-subject", "value"),
+    State("draft-body", "value"),
+    running=[
+        (Output("draft-llm-btn", "disabled"), True, False),
+        (Output("draft-llm-btn", "children"), "Working…", "Refine"),
+    ],
+    prevent_initial_call=True,
+)
+def run_llm_draft(_n, prompt, subject, body):
+    try:
+        result = _llm_draft_email((prompt or "").strip(), subject or "", body or "")
+    except Exception as e:
+        return no_update, no_update, f"LLM error: {e}"
+    _save_last_template(result["subject"], result["body"])
+    return result["subject"], result["body"], None
+
+
+@callback(
+    Output("draft-llm-status", "children"),
+    Input("llm-status-store", "data"),
+)
+def render_llm_status(msg):
+    return msg or ""
 
 
 # @callback(
@@ -2812,7 +3097,6 @@ def render_previews(shortlist, template):
 
 @callback(
     Output("subway-selection-store", "data"),
-    Output("radius-control", "style"),
     Output("radius-label", "children"),
     Input("subway-layer", "clickData"),
     Input("clear-selection-btn", "n_clicks"),
@@ -2821,16 +3105,16 @@ def render_previews(shortlist, template):
 )
 def handle_subway_click(click_data, clear_clicks, radius_km):
     if ctx.triggered_id == "clear-selection-btn":
-        return None, {"display": "none"}, ""
+        return None, "Subway-stop radius (click a stop to use)"
     if not click_data:
-        return no_update, no_update, no_update
+        return no_update, no_update
     coords = (click_data.get("geometry") or {}).get("coordinates", [])
     if len(coords) < 2:
-        return no_update, no_update, no_update
+        return no_update, no_update
     lng, lat = coords[0], coords[1]
     name = (click_data.get("properties") or {}).get("name", "station")
     sel = {"lat": lat, "lng": lng, "name": name}
-    return sel, {"display": "block"}, f"Radius: {name}"
+    return sel, f"Radius: {name}"
 
 
 @callback(
@@ -3045,10 +3329,71 @@ app.clientside_callback(
 
 def _interpolate(template: str, variables: dict) -> str:
     return re.sub(
-        r"\{(\w+)\}",
+        r"\{\{(\w+)\}\}",
         lambda m: str(variables.get(m.group(1), m.group(0))),
         template,
     )
+
+
+_LLM_SYSTEM_PROMPT = (
+    "You draft short cold-outreach emails sent to NYC landlords on behalf of "
+    "a renter looking for a rent-stabilized apartment. The output is a "
+    "template: it must use double-brace variables like {{owner_name}} and "
+    "{{address}} so the app can fan it out per recipient. "
+    f"Available variables: {', '.join('{{' + v + '}}' for v in AVAILABLE_TEMPLATE_VARS)}. "
+    "Use {{property_label}} (not {{address}}) in the subject line — it "
+    "resolves to a single street address when the owner has one building "
+    "and a generic 'your N properties' when they have more. Sign the email "
+    "with {{sender_name}}. "
+    "Keep the body under 120 words, polite, friendly, and direct. "
+    "Respond with strict JSON of the form "
+    '{"subject": "...", "body": "..."} — no preamble, no markdown fences, '
+    "no commentary."
+)
+
+
+def _llm_draft_email(prompt: str, current_subject: str, current_body: str) -> dict:
+    """Call Claude to generate or refine an email template.
+
+    Returns {"subject": str, "body": str}. Raises on API failure or unparseable output.
+    """
+    client = Anthropic()
+    instruction = prompt.strip() if prompt else ""
+    if current_body.strip():
+        body_msg = (
+            "Refine this email template. Preserve the {{double_brace}} variables "
+            "where they still make sense.\n\n"
+            f"Current subject: {current_subject!r}\n"
+            f"Current body:\n{current_body}"
+        )
+        user_msg = (
+            f"{body_msg}\n\nInstruction: {instruction}" if instruction
+            else f"{body_msg}\n\nNo specific instruction — polish wording, tighten phrasing, "
+                 "and improve flow without changing the intent."
+        )
+    else:
+        base = (
+            "Draft a new email template. Use {{double_brace}} variables to personalize "
+            "per recipient."
+        )
+        user_msg = (
+            f"{base}\n\nInstruction: {instruction}" if instruction
+            else f"{base}\n\nNo specific instruction — write a friendly, concise "
+                 "inquiry asking whether anything is currently available or "
+                 "expected to open up."
+        )
+    resp = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1024,
+        system=_LLM_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+    text = "".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip()
+    # Strip optional ```json fences defensively.
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.DOTALL)
+    parsed = json.loads(text)
+    return {"subject": str(parsed.get("subject", "")), "body": str(parsed.get("body", ""))}
 
 
 if __name__ == "__main__":
