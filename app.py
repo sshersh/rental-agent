@@ -29,9 +29,17 @@ load_dotenv()
 agent_cache.init_db()
 
 AVAILABLE_TEMPLATE_VARS = [
-    "owner_name", "address", "addresses", "property_label", "building_count",
-    "zip", "block", "lot", "office", "phone", "sender_name", "sender_email",
+    "owner_name", "owner_first_name", "address", "street_address",
+    "addresses", "property_label", "building_count", "zip", "block", "lot",
+    "office", "phone", "sender_name", "sender_email",
 ]
+
+_COMPANY_MARKERS = {
+    "LLC", "LP", "LLP", "PC", "PLLC", "INC", "CORP", "LTD",
+    "MGMT", "REALTY", "REALTORS", "PROPERTIES", "PROPERTY",
+    "MANAGEMENT", "ASSOCIATES", "PARTNERS", "GROUP", "HOLDINGS",
+    "ENTERPRISES", "CAPITAL", "VENTURES", "TRUST",
+}
 
 _NAME_ACRONYMS = {
     "LLC", "LP", "LLP", "PC", "PLLC", "INC", "INC.", "CORP", "CORP.",
@@ -62,12 +70,63 @@ def _format_owner_name(name: str) -> str:
     return " ".join(out)
 
 
+def _owner_first_name(name: str) -> str:
+    """First name for human owners; "there" for company names.
+
+    Heuristic: any word matching a company marker (LLC, Realty, Group, …)
+    flips the whole record to company-mode so we don't greet "ABC Realty
+    LLC" as "Hi ABC,". Matches the `_format_owner_name` fallback.
+    """
+    if not name or not name.strip():
+        return "there"
+    stripped_words = {w.upper().rstrip(".,") for w in name.split()}
+    if stripped_words & _COMPANY_MARKERS:
+        return "there"
+    parts = _format_owner_name(name).split()
+    return parts[0] if parts else "there"
+
+
+def _street_only(addr: str) -> str:
+    """'129 6th Avenue, Brooklyn' -> '129 6th Avenue'. Splits on the first
+    comma — borough/city/state/zip all live to the right of it in our data."""
+    if not addr:
+        return ""
+    return addr.split(",", 1)[0].strip()
+
+
 def _property_label(buildings: list) -> str:
     """Subject-friendly label: address for single, generic for portfolio."""
     n = len(buildings or [])
     if n <= 1:
         return (buildings[0].get("address", "") if n else "") or ""
     return f"your {n} properties"
+
+
+def _build_owner_ctx(owner: dict) -> dict:
+    """Per-owner template ctx — shared by preview rendering and SMTP send.
+
+    Reads SENDER_NAME and EMAIL_USER from env at call time so .env edits
+    take effect without restart.
+    """
+    bs = owner.get("buildings", [])
+    addresses_str = "; ".join(b["address"] for b in bs)
+    first = bs[0] if bs else {}
+    return {
+        "owner_name":       _format_owner_name(owner.get("name") or ""),
+        "owner_first_name": _owner_first_name(owner.get("name") or ""),
+        "address":          first.get("address", ""),
+        "street_address":   _street_only(first.get("address", "")),
+        "addresses":      addresses_str,
+        "property_label": _property_label(bs),
+        "building_count": len(bs),
+        "zip":            first.get("zip", ""),
+        "block":          first.get("block", ""),
+        "lot":            first.get("lot", ""),
+        "office":         owner.get("office", "") or "",
+        "phone":          owner.get("phone", "") or "",
+        "sender_name":    os.getenv("SENDER_NAME", "Sam Shersher"),
+        "sender_email":   os.getenv("EMAIL_USER", "(your email)"),
+    }
 
 
 LOOKUP_TIMEOUT_SECONDS = 240   # local agent runs (WoW + multi-owner ContactOut) take ~1–3 min
@@ -537,12 +596,18 @@ SIDEBAR_DRAFT_VIEW = html.Div(
                     },
                     className="form-control mb-2",
                 ),
-                dbc.Button(
-                    "Generate",
-                    id="draft-llm-btn",
-                    color="primary",
-                    size="sm",
-                    className="w-100 mb-1",
+                dcc.Loading(
+                    id="draft-llm-loading",
+                    type="circle",
+                    color="#ffffff",
+                    delay_show=400,
+                    children=dbc.Button(
+                        "Generate",
+                        id="draft-llm-btn",
+                        color="primary",
+                        size="sm",
+                        className="w-100 mb-1",
+                    ),
                 ),
                 html.Div(
                     id="draft-llm-status",
@@ -575,14 +640,27 @@ SIDEBAR_DRAFT_VIEW = html.Div(
         ),
         # ── Send button footer (fixed) ────────────────────────────────
         html.Div(
-            dbc.Button(
-                "Send (coming soon)",
-                id="draft-send-btn",
-                color="danger",
-                size="sm",
-                className="w-100",
-                disabled=True,
-            ),
+            [
+                html.Small(
+                    id="draft-send-summary",
+                    className="text-secondary d-block mb-1",
+                    style={"fontSize": "11px"},
+                ),
+                dcc.Loading(
+                    id="draft-send-loading",
+                    type="circle",
+                    color="#ffffff",
+                    delay_show=400,
+                    children=dbc.Button(
+                        "Send emails",
+                        id="draft-send-btn",
+                        color="danger",
+                        size="sm",
+                        className="w-100",
+                    ),
+                ),
+                html.Div(id="draft-send-status", className="mt-2"),
+            ],
             className="p-3 border-top border-secondary",
             style={"flex": "0 0 auto"},
         ),
@@ -907,6 +985,7 @@ app.layout = html.Div(
         dcc.Store(id="shortlist-store", storage_type="local"),
         dcc.Store(id="sidebar-mode-store", storage_type="session", data="shortlist"),
         dcc.Store(id="llm-status-store", data=None),
+        dcc.Store(id="email-sent-signal", data=0),
         dcc.Store(id="bbox-store", data=None),
         dcc.Store(id="subway-selection-store", data=None),
         dcc.Store(id="modal-building-id", data=None),
@@ -2452,7 +2531,22 @@ def _owner_card(o):
                 title="Show co-owners on shared buildings",
             )
         )
-    if has_email:
+    if o.get("email_sent_at"):
+        row_children.append(
+            html.Span(
+                "✓ email sent",
+                className="badge bg-success",
+                style={
+                    "fontSize": "9px",
+                    "padding": "3px 6px",
+                    "flexShrink": "0",
+                    "alignSelf": "center",
+                    "fontWeight": "500",
+                },
+                title="An outreach email has been sent to this owner.",
+            )
+        )
+    elif has_email:
         row_children.append(
             dbc.Button(
                 "+ Shortlist",
@@ -2543,8 +2637,9 @@ def _owner_card_with_coowners(o: dict, coowners_expanded: set[str]):
     Input("lookup-status", "data"),
     Input("all-owners-expanded", "data"),
     Input("coowners-expanded-keys", "data"),
+    Input("email-sent-signal", "data"),
 )
-def render_all_owners(lookup_status, expanded, coowners_expanded_keys):
+def render_all_owners(lookup_status, expanded, coowners_expanded_keys, _email_sent_signal):
     owners = _all_discovered_owners(lookup_status)
     total = len(owners)
     btn_hidden = {"fontSize": "10px", "display": "none"}
@@ -2950,21 +3045,7 @@ def render_previews(shortlist, subject, body):
     for o in shortlist:
         bs = o.get("buildings", [])
         addresses_str = "; ".join(b["address"] for b in bs)
-        first = bs[0] if bs else {}
-        ctx_vars = {
-            "owner_name":    _format_owner_name(o.get("name") or ""),
-            "address":       first.get("address", ""),
-            "addresses":     addresses_str,
-            "property_label": _property_label(bs),
-            "building_count": len(bs),
-            "zip":           first.get("zip", ""),
-            "block":         first.get("block", ""),
-            "lot":           first.get("lot", ""),
-            "office":        o.get("office", "") or "",
-            "phone":         o.get("phone", "") or "",
-            "sender_name":   os.getenv("SENDER_NAME", "Sam Shersher"),
-            "sender_email":  os.getenv("EMAIL_USER", "(your email)"),
-        }
+        ctx_vars = _build_owner_ctx(o)
         subject_preview = _interpolate(subject or "", ctx_vars)
         body_preview = _interpolate(body or "", ctx_vars)
         items.append(
@@ -3030,7 +3111,6 @@ def render_previews(shortlist, subject, body):
     State("draft-body", "value"),
     running=[
         (Output("draft-llm-btn", "disabled"), True, False),
-        (Output("draft-llm-btn", "children"), "Working…", "Refine"),
     ],
     prevent_initial_call=True,
 )
@@ -3051,46 +3131,138 @@ def render_llm_status(msg):
     return msg or ""
 
 
-# @callback(
-#     Output("send-status", "children"),
-#     Input("send-btn", "n_clicks"),
-#     State("shortlist-store", "data"),
-#     State({"type": "owner-email", "id": ALL}, "value"),
-#     State("email-template", "value"),
-#     prevent_initial_call=True,
-# )
-# def send_emails(_, shortlist, email_values, template):
-#     if not shortlist:
-#         return dbc.Alert("Shortlist is empty.", color="warning", duration=4000)
-#     email_user = os.getenv("EMAIL_USER", "")
-#     email_pass = os.getenv("EMAIL_APP_PASSWORD", "")
-#     if not email_user or not email_pass:
-#         return dbc.Alert(
-#             "Set EMAIL_USER and EMAIL_APP_PASSWORD in a .env file.", color="danger"
-#         )
-#     recipients = [(b, e) for b, e in zip(shortlist, email_values or []) if e]
-#     if not recipients:
-#         return dbc.Alert("No owner emails entered — fill them in above.", color="warning")
-#     sent, failed = 0, 0
-#     try:
-#         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-#             server.login(email_user, email_pass)
-#             for b, to_addr in recipients:
-#                 body = _interpolate(template or "", {**b, "sender_email": email_user})
-#                 msg = MIMEMultipart()
-#                 msg["From"] = email_user
-#                 msg["To"] = to_addr
-#                 msg["Subject"] = f"Apartment inquiry — {b.get('address', '')}"
-#                 msg.attach(MIMEText(body, "plain"))
-#                 try:
-#                     server.sendmail(email_user, to_addr, msg.as_string())
-#                     sent += 1
-#                 except Exception:
-#                     failed += 1
-#     except Exception as e:
-#         return dbc.Alert(f"SMTP error: {e}", color="danger")
-#     color = "success" if not failed else "warning"
-#     return dbc.Alert(f"Sent {sent} · Failed {failed}", color=color, duration=6000)
+_EMAIL_VALIDATE_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+
+
+@callback(
+    Output("draft-send-summary", "children"),
+    Input("shortlist-store", "data"),
+    Input({"type": "owner-email", "id": ALL}, "value"),
+)
+def render_send_summary(shortlist, email_values):
+    total = len(shortlist or [])
+    if total == 0:
+        return "Add owners to the shortlist before sending."
+    filled = sum(
+        1 for v in (email_values or [])
+        if v and _EMAIL_VALIDATE_RE.match(v.strip())
+    )
+    skipped = total - filled
+    if filled == 0:
+        return "No owners have a valid email — none will be sent."
+    parts = [f"Will send {filled} email{'s' if filled != 1 else ''}"]
+    if skipped > 0:
+        parts.append(f"{skipped} skipped (no email)")
+    return " · ".join(parts)
+
+
+@callback(
+    Output("draft-send-status", "children"),
+    Output("email-sent-signal", "data"),
+    Output("shortlist-store", "data", allow_duplicate=True),
+    Input("draft-send-btn", "n_clicks"),
+    State("shortlist-store", "data"),
+    State({"type": "owner-email", "id": ALL}, "value"),
+    State({"type": "owner-email", "id": ALL}, "id"),
+    State("draft-subject", "value"),
+    State("draft-body", "value"),
+    running=[(Output("draft-send-btn", "disabled"), True, False)],
+    prevent_initial_call=True,
+)
+def send_draft(_n, shortlist, email_values, email_ids, subject_tpl, body_tpl):
+    if not shortlist:
+        return dbc.Alert("Shortlist is empty.", color="warning", duration=4000), no_update, no_update
+    email_user = os.getenv("EMAIL_USER", "").strip()
+    email_pass = os.getenv("EMAIL_APP_PASSWORD", "").strip()
+    if not email_user or not email_pass:
+        return dbc.Alert(
+            "Set EMAIL_USER and EMAIL_APP_PASSWORD in your .env file.",
+            color="danger",
+        ), no_update, no_update
+    if not (subject_tpl or "").strip() or not (body_tpl or "").strip():
+        return dbc.Alert(
+            "Subject and body must be non-empty before sending.",
+            color="warning",
+            duration=5000,
+        ), no_update, no_update
+    sender_name = os.getenv("SENDER_NAME", "Sam Shersher")
+
+    # Map current owner-email input values by owner_key (input ids are dicts).
+    owner_email_by_key = {
+        eid.get("id"): (val or "").strip()
+        for eid, val in zip(email_ids or [], email_values or [])
+    }
+
+    queue = []
+    for owner in shortlist:
+        key = owner.get("owner_key")
+        addr = owner_email_by_key.get(key, "")
+        if not addr or not _EMAIL_VALIDATE_RE.match(addr):
+            continue
+        queue.append((owner, addr))
+
+    if not queue:
+        return dbc.Alert(
+            "No valid recipient emails — fill in the per-owner email fields above.",
+            color="warning",
+            duration=5000,
+        ), no_update, no_update
+
+    sent, failed, errors = 0, 0, []
+    sent_keys: set[str] = set()
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
+            server.login(email_user, email_pass)
+            for owner, to_addr in queue:
+                ctx = _build_owner_ctx(owner)
+                subject = _interpolate(subject_tpl, ctx).strip() or "Inquiry"
+                body = _interpolate(body_tpl, ctx)
+
+                msg = MIMEMultipart()
+                msg["From"] = f"{sender_name} <{email_user}>"
+                msg["To"] = to_addr
+                msg["Subject"] = subject
+                msg["Reply-To"] = email_user
+                msg.attach(MIMEText(body, "plain", _charset="utf-8"))
+
+                try:
+                    server.sendmail(email_user, [to_addr], msg.as_string())
+                    sent += 1
+                    sent_keys.add(owner.get("owner_key"))
+                    agent_cache.mark_email_sent(owner.get("name") or "")
+                except Exception as e:
+                    failed += 1
+                    errors.append(f"{owner.get('name', '?')}: {e}")
+    except smtplib.SMTPAuthenticationError:
+        return dbc.Alert(
+            "Gmail rejected the login. Use an App Password "
+            "(Google Account → Security → App Passwords), not your normal password.",
+            color="danger",
+        ), no_update, no_update
+    except Exception as e:
+        return dbc.Alert(f"SMTP error: {e}", color="danger"), no_update, no_update
+
+    if sent:
+        signal = int(time.time())
+        next_shortlist = [o for o in shortlist if o.get("owner_key") not in sent_keys]
+    else:
+        signal = no_update
+        next_shortlist = no_update
+
+    if failed:
+        return dbc.Alert(
+            [
+                html.Div(f"Sent {sent} · Failed {failed}"),
+                html.Small("; ".join(errors[:3]), className="d-block mt-1"),
+            ],
+            color="warning",
+            duration=10000,
+        ), signal, next_shortlist
+    return dbc.Alert(
+        f"Sent {sent} email{'s' if sent != 1 else ''} from {email_user}.",
+        color="success",
+        duration=6000,
+    ), signal, next_shortlist
 
 
 # ── Subway stop click → radius selection ──────────────────────────────────
