@@ -15,6 +15,7 @@ import dash
 from dash import dcc, html, Input, Output, State, callback, ALL, ctx, no_update
 import dash_leaflet as dl
 import dash_bootstrap_components as dbc
+import plotly.graph_objects as go
 from dash_extensions.javascript import assign
 from dotenv import load_dotenv
 
@@ -255,13 +256,43 @@ function(feature, latlng, context) {
 
 selected_building_marker = assign("""
 function(feature, latlng, context) {
-    return L.circleMarker(latlng, {
+    const m = L.circleMarker(latlng, {
         radius: 11,
         fillColor: '#FFD700',
         color: '#fff',
         weight: 2.5,
         fillOpacity: 1,
     });
+    const addr = feature.properties && feature.properties.address;
+    if (addr) {
+        m.bindTooltip(addr, {
+            direction: 'top',
+            offset: [0, -8],
+            className: 'selected-bldg-tooltip',
+            sticky: false,
+        });
+    }
+    return m;
+}
+""")
+
+# Cluster icon sized proportional to point count (sqrt scaling keeps the giant
+# clusters from dwarfing the small ones). Replaces the default 3-tier
+# small/medium/large bubbles.
+cluster_to_layer = assign("""
+function(feature, latlng, context) {
+    const n = feature.properties.point_count;
+    const label = feature.properties.point_count_abbreviated;
+    const size = Math.min(72, Math.max(26, 18 + Math.sqrt(n) * 4.5));
+    const inner = size - 10;
+    const icon = L.divIcon({
+        html: '<div style="width:' + inner + 'px;height:' + inner + 'px;'
+            + 'line-height:' + inner + 'px;margin:5px;border-radius:50%;'
+            + 'text-align:center;"><span>' + label + '</span></div>',
+        className: 'marker-cluster marker-cluster-proportional',
+        iconSize: L.point(size, size),
+    });
+    return L.marker(latlng, { icon: icon });
 }
 """)
 
@@ -403,7 +434,7 @@ SIDEBAR_SHORTLIST_VIEW = html.Div(
                             style={"fontSize": "10px"},
                         ),
                     ],
-                    className="d-flex align-items-center mb-2",
+                    className="d-flex align-items-center mb-2 flex-shrink-0",
                 ),
                 html.Div(
                     [
@@ -436,20 +467,25 @@ SIDEBAR_SHORTLIST_VIEW = html.Div(
                         ),
                     ],
                     id="bulk-actions",
-                    className="d-flex gap-1 mb-2",
+                    className="d-flex gap-1 mb-2 flex-shrink-0",
                     style={"display": "none"},
                 ),
                 html.Div(
                     id="selected-list",
-                    style={"maxHeight": "300px", "overflowY": "auto"},
+                    style={
+                        "flex": "1 1 auto",
+                        "minHeight": "0",
+                        "overflowY": "auto",
+                    },
                 ),
                 html.Div(
-                    className="small text-secondary mt-2",
+                    className="small text-secondary mt-2 flex-shrink-0",
                     style={"opacity": "0.5", "fontSize": "10px"},
                     children="Drag area · Click stop+radius · Click marker to add/remove",
                 ),
             ],
-            className="p-3 border-bottom border-secondary",
+            className="p-3 border-bottom border-secondary d-flex flex-column",
+            style={"flex": "1 1 0", "minHeight": "0"},
         ),
         # ── Discovered owners (every primary landlord across all sessions) ──
         html.Div(
@@ -463,25 +499,94 @@ SIDEBAR_SHORTLIST_VIEW = html.Div(
                             style={"fontSize": "10px"},
                         ),
                         dbc.Button(
+                            "Shortlist all",
+                            id="all-owners-shortlist-all-btn",
+                            size="sm",
+                            color="success",
+                            outline=True,
+                            n_clicks=0,
+                            className="ms-auto",
+                            style={
+                                "fontSize": "10px",
+                                "padding": "1px 6px",
+                                "display": "none",
+                            },
+                        ),
+                        dbc.Button(
                             "Show all",
                             id="all-owners-toggle-btn",
                             size="sm",
                             color="link",
                             n_clicks=0,
-                            className="ms-auto p-0",
+                            className="ms-2 p-0",
                             style={"fontSize": "10px", "display": "none"},
                         ),
                     ],
-                    className="d-flex align-items-center mb-2",
+                    className="d-flex align-items-center mb-2 flex-shrink-0",
+                ),
+                # Portfolio-size histogram — drag to filter by # of buildings
+                html.Div(
+                    "Portfolio size",
+                    className="text-secondary text-center flex-shrink-0",
+                    style={
+                        "fontSize": "9px",
+                        "textTransform": "uppercase",
+                        "letterSpacing": "0.04em",
+                        "marginBottom": "1px",
+                    },
+                ),
+                dcc.Graph(
+                    id="owner-size-histogram",
+                    figure=go.Figure().update_layout(
+                        margin=dict(l=4, r=4, t=4, b=16),
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        dragmode="select",
+                        selectdirection="h",
+                    ),
+                    config={
+                        "displayModeBar": False,
+                        "scrollZoom": False,
+                        "doubleClick": "reset",
+                        "staticPlot": False,
+                    },
+                    className="flex-shrink-0",
+                    style={"height": "60px", "marginBottom": "2px"},
+                ),
+                html.Div(
+                    [
+                        html.Span(
+                            id="owner-size-filter-label",
+                            className="text-secondary",
+                            style={"fontSize": "9px"},
+                        ),
+                        dbc.Button(
+                            "clear",
+                            id="owner-size-filter-clear-btn",
+                            color="link",
+                            size="sm",
+                            n_clicks=0,
+                            className="p-0 ms-2",
+                            style={"fontSize": "9px", "display": "none"},
+                        ),
+                    ],
+                    className="d-flex align-items-center mb-2 flex-shrink-0",
+                    style={"minHeight": "12px"},
                 ),
                 html.Div(
                     id="all-owners-items",
                     children=html.P("No lookups yet.", className="small text-secondary"),
+                    style={
+                        "flex": "1 1 auto",
+                        "minHeight": "0",
+                        "overflowY": "auto",
+                    },
                 ),
             ],
-            className="p-3 border-bottom border-secondary",
+            className="p-3 border-bottom border-secondary d-flex flex-column",
+            style={"flex": "2 1 0", "minHeight": "0"},
         ),
-        # ── Shortlisted owners ────────────────────────────────────────
+        # ── Shortlisted owners (pinned at bottom) ──────────────────────
         html.Div(
             [
                 html.Div(
@@ -492,12 +597,21 @@ SIDEBAR_SHORTLIST_VIEW = html.Div(
                             className="badge bg-primary rounded-pill ms-2",
                             style={"fontSize": "10px"},
                         ),
+                        dbc.Button(
+                            "Remove all",
+                            id="shortlist-clear-btn",
+                            color="link",
+                            size="sm",
+                            className="ms-auto p-0 text-danger",
+                            style={"fontSize": "11px", "textDecoration": "none"},
+                        ),
                     ],
-                    className="d-flex align-items-center mb-2",
+                    className="d-flex align-items-center mb-2 flex-shrink-0",
                 ),
                 html.Div(
                     id="shortlist-items",
                     children=html.P("No owners yet.", className="small text-secondary"),
+                    style={"maxHeight": "200px", "overflowY": "auto"},
                 ),
                 dbc.Button(
                     "Draft Email →",
@@ -505,14 +619,20 @@ SIDEBAR_SHORTLIST_VIEW = html.Div(
                     color="success",
                     size="sm",
                     outline=True,
-                    className="w-100 mt-2",
+                    className="w-100 mt-2 flex-shrink-0",
                 ),
             ],
-            className="p-3",
+            className="p-3 border-top border-secondary d-flex flex-column",
+            style={"flex": "0 0 auto"},
         ),
     ],
     id="sidebar-shortlist-view",
-    style={"height": "100%", "overflowY": "auto"},
+    style={
+        "height": "100%",
+        "display": "flex",
+        "flexDirection": "column",
+        "overflow": "hidden",
+    },
 )
 
 SIDEBAR_DRAFT_VIEW = html.Div(
@@ -699,11 +819,20 @@ MAP_AREA = dl.Map(
             zoomToBoundsOnClick=True,
             superClusterOptions={"radius": 80, "maxZoom": 16},
             pointToLayer=building_marker,
+            clusterToLayer=cluster_to_layer,
         ),
-        dl.GeoJSON(
-            id="selected-building-layer",
-            data=EMPTY_GEOJSON,
-            pointToLayer=selected_building_marker,
+        dl.Pane(
+            name="selection-pane",
+            className="selection-pane",
+            style={"zIndex": 450},
+            children=[
+                dl.GeoJSON(
+                    id="selected-building-layer",
+                    data=EMPTY_GEOJSON,
+                    pane="selection-pane",
+                    pointToLayer=selected_building_marker,
+                ),
+            ],
         ),
         dl.LayerGroup(id="selection-shapes", children=[]),
         dl.GeoJSON(
@@ -1000,6 +1129,8 @@ app.layout = html.Div(
         dcc.Interval(id="agent-log-poll", interval=1000, n_intervals=0, disabled=True),
         dcc.Store(id="all-owners-expanded", data=False),
         dcc.Store(id="coowners-expanded-keys", data=[]),
+        dcc.Store(id="owner-size-filter", data=None),
+        dcc.Store(id="zoom-anim-tick", data=0),
         dcc.Interval(id="sel-poll", interval=150, n_intervals=0),
         dcc.Interval(
             id="lookup-poll",
@@ -1358,6 +1489,14 @@ def toggle_zip(show):
 FEATURES_BY_ID  = {f["properties"]["id"]: f["properties"] for f in ALL_FEATURES}
 FEATURES_BY_BBL = {
     _bbl_for(f["properties"]): f["properties"]
+    for f in ALL_FEATURES
+    if _bbl_for(f["properties"])
+}
+BBL_TO_LATLNG = {
+    _bbl_for(f["properties"]): (
+        f["geometry"]["coordinates"][1],
+        f["geometry"]["coordinates"][0],
+    )
     for f in ALL_FEATURES
     if _bbl_for(f["properties"])
 }
@@ -1749,10 +1888,11 @@ def _render_modal_body(props: dict, bbl: str, lookup_status: dict):
     Output("modal-building-id", "data"),
     Input({"type": "building-card", "id": ALL}, "n_clicks"),
     Input("lookup-toast-view-btn", "n_clicks"),
+    Input("selected-building-layer", "clickData"),
     State("lookup-toast-store", "data"),
     prevent_initial_call=True,
 )
-def open_modal(card_clicks, toast_clicks, toast_data):
+def open_modal(card_clicks, toast_clicks, sel_click, toast_data):
     trig = ctx.triggered_id
     if isinstance(trig, dict) and trig.get("type") == "building-card":
         if not any(n for n in (card_clicks or []) if n):
@@ -1766,6 +1906,12 @@ def open_modal(card_clicks, toast_clicks, toast_data):
         if not props:
             return no_update, no_update
         return True, props["id"]
+    if trig == "selected-building-layer":
+        props = (sel_click or {}).get("properties") or {}
+        bid = props.get("id")
+        if not bid:
+            return no_update, no_update
+        return True, bid
     return no_update, no_update
 
 
@@ -2468,6 +2614,86 @@ def _all_discovered_owners(_lookup_status=None):
 _ALL_OWNERS_PAGE = 10
 
 
+def _selected_bbls(selected_building_ids) -> set:
+    bbls: set[str] = set()
+    for bid in selected_building_ids or []:
+        props = FEATURES_BY_ID.get(bid)
+        if not props:
+            continue
+        bbl = _bbl_for(props)
+        if bbl:
+            bbls.add(bbl)
+    return bbls
+
+
+def _filter_owners_by_selection(owners, selected_building_ids):
+    """When a selection is active, return only owners with at least one
+    building in the selection. The owner's `buildings` list is left intact —
+    we filter inclusion, not the portfolio itself."""
+    sel = _selected_bbls(selected_building_ids)
+    if not sel:
+        return list(owners)
+    return [
+        o for o in owners
+        if any(b.get("bbl") in sel for b in (o.get("buildings") or []))
+    ]
+
+
+_SIZE_HISTOGRAM_MAX = 40
+
+
+def _build_size_histogram_fig(owners):
+    # Everything >= _SIZE_HISTOGRAM_MAX collapses into the rightmost bucket so
+    # one or two megalandlords don't blow out the x-axis on the small chart.
+    counts: dict[int, int] = {}
+    for o in owners:
+        n = len(o.get("buildings") or [])
+        if n > 0:
+            bucket = min(n, _SIZE_HISTOGRAM_MAX)
+            counts[bucket] = counts.get(bucket, 0) + 1
+    xs = sorted(counts.keys())
+    ys = [counts[x] for x in xs]
+    custom = [
+        [f"{_SIZE_HISTOGRAM_MAX}+" if x >= _SIZE_HISTOGRAM_MAX else str(x)]
+        for x in xs
+    ]
+    if xs:
+        fig = go.Figure(go.Bar(
+            x=xs, y=ys,
+            customdata=custom,
+            marker=dict(color="#4fc3f7", line=dict(width=0)),
+            hovertemplate="%{customdata[0]} bldgs · %{y} owners<extra></extra>",
+        ))
+    else:
+        fig = go.Figure()
+    tickvals = [v for v in (10, 20, 30, _SIZE_HISTOGRAM_MAX)]
+    ticktext = [str(v) if v < _SIZE_HISTOGRAM_MAX else f"{_SIZE_HISTOGRAM_MAX}+"
+                for v in tickvals]
+    fig.update_layout(
+        template="plotly_dark",
+        margin=dict(l=4, r=4, t=4, b=16),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        dragmode="select",
+        selectdirection="h",
+        showlegend=False,
+        xaxis=dict(
+            title=None,
+            tickfont=dict(size=8, color="#888"),
+            showgrid=False,
+            zeroline=False,
+            fixedrange=True,
+            range=[0.5, _SIZE_HISTOGRAM_MAX + 0.5],
+            tickmode="array",
+            tickvals=tickvals,
+            ticktext=ticktext,
+        ),
+        yaxis=dict(visible=False, fixedrange=True),
+        bargap=0.15,
+    )
+    return fig
+
+
 def _owner_card(o):
     has_email = bool(o.get("email"))
     bs = o.get("buildings", [])
@@ -2634,23 +2860,48 @@ def _owner_card_with_coowners(o: dict, coowners_expanded: set[str]):
     Output("all-owners-count", "children"),
     Output("all-owners-toggle-btn", "children"),
     Output("all-owners-toggle-btn", "style"),
+    Output("all-owners-shortlist-all-btn", "children"),
+    Output("all-owners-shortlist-all-btn", "style"),
     Input("lookup-status", "data"),
     Input("all-owners-expanded", "data"),
     Input("coowners-expanded-keys", "data"),
     Input("email-sent-signal", "data"),
+    Input("selected-buildings", "data"),
+    Input("owner-size-filter", "data"),
 )
-def render_all_owners(lookup_status, expanded, coowners_expanded_keys, _email_sent_signal):
-    owners = _all_discovered_owners(lookup_status)
-    total = len(owners)
+def render_all_owners(lookup_status, expanded, coowners_expanded_keys,
+                      _email_sent_signal, selected_ids, size_filter):
     btn_hidden = {"fontSize": "10px", "display": "none"}
     btn_visible = {"fontSize": "10px", "display": "inline-block"}
+    sl_hidden = {"fontSize": "10px", "padding": "1px 6px", "display": "none"}
+    sl_visible = {"fontSize": "10px", "padding": "1px 6px", "display": "inline-block"}
+    all_owners = _all_discovered_owners(lookup_status)
+    if not all_owners:
+        return (html.P("No lookups yet.", className="small text-secondary"),
+                "", "", btn_hidden, "Shortlist all", sl_hidden)
+
+    owners = _filter_owners_by_selection(all_owners, selected_ids)
+    if size_filter:
+        lo, hi = size_filter
+        # The rightmost bar represents `_SIZE_HISTOGRAM_MAX+`, so selecting up
+        # to it should include all owners with at least that many buildings.
+        hi_eff = math.inf if hi >= _SIZE_HISTOGRAM_MAX else hi
+        owners = [o for o in owners
+                  if lo <= len(o.get("buildings") or []) <= hi_eff]
+    total = len(owners)
     if not owners:
-        return html.P("No lookups yet.", className="small text-secondary"), "", "", btn_hidden
+        msg = ("No discovered owners in selection."
+               if selected_ids else "No owners match the current filter.")
+        return (html.P(msg, className="small text-secondary"),
+                "0", "", btn_hidden, "Shortlist all", sl_hidden)
 
     # Split by contact reachability. Owners we have an email for are far more
     # useful (clickable + shortlistable + email-blastable) so they sit first.
     with_email    = [o for o in owners if o.get("email")]
     without_email = [o for o in owners if not o.get("email")]
+    shortlistable = [o for o in with_email if not o.get("email_sent_at")]
+    sl_btn_label = f"+ Shortlist all ({len(shortlistable)})"
+    sl_btn_style = sl_visible if shortlistable else sl_hidden
 
     if expanded:
         we_show, ne_show = with_email, without_email
@@ -2674,9 +2925,9 @@ def render_all_owners(lookup_status, expanded, coowners_expanded_keys, _email_se
         len(with_email) > _ALL_OWNERS_PAGE or len(without_email) > _ALL_OWNERS_PAGE
     )
     if not truncated and not expanded:
-        return items, str(total), "", btn_hidden
+        return items, str(total), "", btn_hidden, sl_btn_label, sl_btn_style
     btn_label = "Hide" if expanded else f"Show all ({total})"
-    return items, str(total), btn_label, btn_visible
+    return items, str(total), btn_label, btn_visible, sl_btn_label, sl_btn_style
 
 
 @callback(
@@ -2710,6 +2961,120 @@ def toggle_coowners(clicks, current):
 )
 def toggle_all_owners(n, expanded):
     return not expanded if n else expanded
+
+
+@callback(
+    Output("main-map", "viewport"),
+    Input({"type": "all-owner-row", "id": ALL}, "n_clicks"),
+    State("lookup-status", "data"),
+    prevent_initial_call=True,
+)
+def zoom_to_owner_buildings(clicks, lookup_status):
+    trig = ctx.triggered_id
+    if not isinstance(trig, dict) or trig.get("type") != "all-owner-row":
+        return no_update
+    # Pattern-matched inputs fire on initial render with all-zero clicks.
+    if not any(c for c in (clicks or []) if c):
+        return no_update
+    owners = _all_discovered_owners(lookup_status)
+    owner = next((o for o in owners if o.get("owner_key") == trig.get("id")), None)
+    if not owner:
+        return no_update
+    coords = [
+        BBL_TO_LATLNG[b["bbl"]]
+        for b in owner.get("buildings", [])
+        if b.get("bbl") in BBL_TO_LATLNG
+    ]
+    if not coords:
+        return no_update
+    lats = [c[0] for c in coords]
+    lngs = [c[1] for c in coords]
+    # Pad the box so markers aren't flush against the edge. Floor at ~0.001°
+    # (~100m) so a single-building portfolio still gets a sensible street-level
+    # zoom instead of zero-area bounds.
+    pad_lat = max((max(lats) - min(lats)) * 0.15, 0.001)
+    pad_lng = max((max(lngs) - min(lngs)) * 0.15, 0.001)
+    return {
+        "transition": "flyToBounds",
+        "bounds": [
+            [min(lats) - pad_lat, min(lngs) - pad_lng],
+            [max(lats) + pad_lat, max(lngs) + pad_lng],
+        ],
+        "options": {
+            "padding": [20, 20],
+            "maxZoom": 17,
+            "duration": 0.18,
+            "easeLinearity": 0.6,
+        },
+    }
+
+
+app.clientside_callback(
+    """
+    function(clicks) {
+        if (!clicks || !clicks.some(c => c)) {
+            return window.dash_clientside.no_update;
+        }
+        const el = document.querySelector('.selection-pane');
+        if (!el) return window.dash_clientside.no_update;
+        el.classList.add('fly-hide');
+        // Animation duration above is 180ms; restore just after that.
+        clearTimeout(window._selPaneRestoreTimer);
+        window._selPaneRestoreTimer = setTimeout(
+            () => el.classList.remove('fly-hide'), 230,
+        );
+        return Date.now();
+    }
+    """,
+    Output("zoom-anim-tick", "data"),
+    Input({"type": "all-owner-row", "id": ALL}, "n_clicks"),
+    prevent_initial_call=True,
+)
+
+
+@callback(
+    Output("owner-size-histogram", "figure"),
+    Input("lookup-status", "data"),
+    Input("email-sent-signal", "data"),
+    Input("selected-buildings", "data"),
+    Input("owner-size-filter-clear-btn", "n_clicks"),
+)
+def update_owner_size_histogram(lookup_status, _email_sent_signal, selected_ids, _clear):
+    # Rebuilding the figure also resets any active box-select on it, which is
+    # what we want when the user clicks "clear" or changes the selection.
+    owners = _filter_owners_by_selection(
+        _all_discovered_owners(lookup_status), selected_ids
+    )
+    return _build_size_histogram_fig(owners)
+
+
+@callback(
+    Output("owner-size-filter", "data"),
+    Output("owner-size-filter-label", "children"),
+    Output("owner-size-filter-clear-btn", "style"),
+    Input("owner-size-histogram", "selectedData"),
+    Input("owner-size-filter-clear-btn", "n_clicks"),
+    Input("selected-buildings", "data"),
+)
+def update_owner_size_filter(selected_data, _clear_clicks, _selected_ids):
+    hidden = {"fontSize": "9px", "display": "none"}
+    visible = {"fontSize": "9px", "display": "inline-block"}
+    trig = ctx.triggered_id
+    # Clear button OR selection change → drop the size filter.
+    if trig in ("owner-size-filter-clear-btn", "selected-buildings"):
+        return None, "", hidden
+    if not selected_data or not selected_data.get("points"):
+        return None, "", hidden
+    xs = [p.get("x") for p in selected_data["points"] if p.get("x") is not None]
+    if not xs:
+        return None, "", hidden
+    lo, hi = min(xs), max(xs)
+    hi_label = f"{_SIZE_HISTOGRAM_MAX}+" if hi >= _SIZE_HISTOGRAM_MAX else str(hi)
+    if lo == hi:
+        label = f"size: {hi_label} bldg" + ("" if hi_label.endswith("+") else "")
+    else:
+        label = f"size: {lo}–{hi_label} bldgs"
+    return [lo, hi], label, visible
 
 
 # ── Selection mutations ──────────────────────────────────────────────────
@@ -2891,13 +3256,17 @@ def _merge_owners_into_shortlist(shortlist, new_owners):
     Input("bulk-shortlist-btn", "n_clicks"),
     Input("modal-shortlist-btn", "n_clicks"),
     Input({"type": "all-owner-shortlist-btn", "id": ALL}, "n_clicks"),
+    Input("all-owners-shortlist-all-btn", "n_clicks"),
     State("selected-buildings", "data"),
     State("modal-building-id", "data"),
     State("lookup-status", "data"),
+    State("owner-size-filter", "data"),
     State("shortlist-store", "data"),
     prevent_initial_call=True,
 )
-def add_owners_to_shortlist(_bulk, _modal, _per_owner, selected_ids, modal_bid, lookup_status, shortlist):
+def add_owners_to_shortlist(_bulk, _modal, _per_owner, _shortlist_all,
+                            selected_ids, modal_bid, lookup_status,
+                            size_filter, shortlist):
     trig = ctx.triggered_id
     shortlist = list(shortlist or [])
     if trig == "bulk-shortlist-btn":
@@ -2915,6 +3284,20 @@ def add_owners_to_shortlist(_bulk, _modal, _per_owner, selected_ids, modal_bid, 
         if not target:
             return no_update
         new_owners = [target]
+    elif trig == "all-owners-shortlist-all-btn":
+        # Mirror render_all_owners's visibility logic so the button shortlists
+        # exactly what the user sees. Skip owners already emailed (they're not
+        # interactive in the list either).
+        visible = _filter_owners_by_selection(
+            _all_discovered_owners(lookup_status), selected_ids
+        )
+        if size_filter:
+            lo, hi = size_filter
+            hi_eff = math.inf if hi >= _SIZE_HISTOGRAM_MAX else hi
+            visible = [o for o in visible
+                       if lo <= len(o.get("buildings") or []) <= hi_eff]
+        new_owners = [o for o in visible
+                      if o.get("email") and not o.get("email_sent_at")]
     else:
         return no_update
     if not new_owners:
@@ -2989,6 +3372,26 @@ def remove_owner_from_shortlist(n_clicks_list, shortlist):
 
 
 @callback(
+    Output("shortlist-store", "data", allow_duplicate=True),
+    Input("shortlist-clear-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def clear_shortlist(_n):
+    return []
+
+
+@callback(
+    Output("shortlist-clear-btn", "style"),
+    Input("shortlist-store", "data"),
+)
+def toggle_clear_btn(shortlist):
+    base = {"fontSize": "11px", "textDecoration": "none"}
+    if not shortlist:
+        return {**base, "display": "none"}
+    return base
+
+
+@callback(
     Output("sidebar-mode-store", "data", allow_duplicate=True),
     Input("open-email-btn", "n_clicks"),
     prevent_initial_call=True,
@@ -3012,7 +3415,12 @@ def exit_draft_mode(_n):
     Input("sidebar-mode-store", "data"),
 )
 def render_sidebar_mode(mode):
-    shortlist_show = {"display": "block", "height": "100%", "overflowY": "auto"}
+    shortlist_show = {
+        "display": "flex",
+        "flexDirection": "column",
+        "height": "100%",
+        "overflow": "hidden",
+    }
     shortlist_hide = {"display": "none"}
     draft_show = {"display": "flex", "flexDirection": "column", "height": "100%"}
     draft_hide = {"display": "none"}

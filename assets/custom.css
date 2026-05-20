@@ -28,6 +28,18 @@ body {
     border-radius: 3px;
 }
 
+/* Selected-building hover tooltip */
+.selected-bldg-tooltip {
+    background: #1a1a2e;
+    color: #FFD700;
+    border: 1px solid #FFD700;
+    font-size: 11px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    white-space: nowrap;
+    font-weight: 500;
+}
+
 /* Subway station tooltip */
 .subway-tooltip {
     background: #111;
@@ -61,16 +73,23 @@ body {
     pointer-events: none !important;
 }
 
-/* Cluster markers */
-.marker-cluster-small,
-.marker-cluster-medium,
-.marker-cluster-large {
-    background-color: rgba(229, 57, 53, 0.4) !important;
+/* Selection highlight pane — toggled off mid-fly via clientside callback */
+.selection-pane {
+    transition: opacity 80ms linear;
 }
-.marker-cluster-small div,
-.marker-cluster-medium div,
-.marker-cluster-large div {
-    background-color: rgba(229, 57, 53, 0.8) !important;
+.selection-pane.fly-hide {
+    opacity: 0;
+}
+
+/* Cluster markers — sized proportionally by clusterToLayer (app.py).
+   Outer halo + inner solid disc both circular regardless of icon size. */
+.marker-cluster-proportional {
+    background-color: rgba(229, 57, 53, 0.4) !important;
+    border-radius: 50% !important;
+}
+.marker-cluster-proportional div {
+    background-color: rgba(229, 57, 53, 0.85) !important;
     color: #fff !important;
     font-weight: bold;
+    font: 12px "Helvetica Neue", Arial, Helvetica, sans-serif;
 }
