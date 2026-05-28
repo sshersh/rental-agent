@@ -3,12 +3,11 @@ import math
 import os
 import json
 import re
-import smtplib
 import threading
 import time
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 from pathlib import Path
+
+from flask import jsonify, request
 
 import pandas as pd
 import dash
@@ -23,6 +22,7 @@ from anthropic import Anthropic
 
 import agent_cache
 import agent_runner
+import email_sender
 from agent_runner import run_landlord_lookup
 from agent_to_storage import translate as translate_agent_result
 
@@ -126,7 +126,10 @@ def _build_owner_ctx(owner: dict) -> dict:
         "office":         owner.get("office", "") or "",
         "phone":          owner.get("phone", "") or "",
         "sender_name":    os.getenv("SENDER_NAME", "Sam Shersher"),
-        "sender_email":   os.getenv("EMAIL_USER", "(your email)"),
+        "sender_email":   (
+            os.getenv("RESEND_FROM_ADDRESS")
+            or os.getenv("EMAIL_USER", "(your email)")
+        ),
     }
 
 
@@ -893,7 +896,7 @@ BUILDING_DETAIL_MODAL = dbc.Modal(
 
 JOB_TRACKER_WIDTH = 600         # expanded panel width
 JOB_TRACKER_MIN_WIDTH = 36      # minimized strip width (chevron only)
-SIDEBAR_WIDTH_PX = 280          # must match SIDEBAR's width style
+SIDEBAR_WIDTH_PX = 400          # must match SIDEBAR's width style
 
 # Slides in absolutely-positioned to the LEFT of the sidebar when a job is
 # active. Minimizable to a thin chevron strip via `job-tracker-toggle-btn`.
@@ -1379,13 +1382,27 @@ def _selected_cards(building_ids, lookup_status=None):
             className="small text-secondary mb-0",
         )
     status_map = lookup_status or {}
-    cards = []
+    # Resolve displayed cards to (bid, props, bbl, session-status) up front so
+    # we can batch the cross-session cache check below.
+    rows = []
+    idle_bbls = []
     for bid in building_ids[:SELECTED_CARD_LIMIT]:
         props = FEATURES_BY_ID.get(bid)
         if not props:
             continue
         bbl = _bbl_for(props)
         st = (status_map.get(bbl) or {}).get("status", "idle")
+        rows.append((props, bbl, st))
+        if st == "idle":
+            idle_bbls.append(bbl)
+    # lookup-status is session-scoped; results from prior sessions live only in
+    # the persistent cache. Promote those idle cards to "done" so they don't
+    # show a stale "Lookup" button (mirrors the modal's backfill).
+    cached_bbls = agent_cache.get_cached_bbls(idle_bbls) if idle_bbls else set()
+    cards = []
+    for props, bbl, st in rows:
+        if st == "idle" and bbl in cached_bbls:
+            st = "done"
         cards.append(
             html.Div(
                 [
@@ -3564,10 +3581,49 @@ def render_send_summary(shortlist, email_values):
     return " · ".join(parts)
 
 
+def _validate_email_deliverable(addr: str) -> bool:
+    """Strict pre-flight: regex shape, then MX lookup via `email-validator`.
+    Falls back to regex-only if the package isn't installed."""
+    if not addr or not _EMAIL_VALIDATE_RE.match(addr):
+        return False
+    try:
+        from email_validator import validate_email, EmailNotValidError
+    except ImportError:
+        return True  # regex passed; trust it
+    try:
+        validate_email(addr, check_deliverability=True)
+        return True
+    except Exception:  # EmailNotValidError or DNS hiccup
+        return False
+
+
+def _build_email_candidates(owner: dict, manual_override: str | None) -> list[str]:
+    """Ordered, deduped, MX-validated candidate emails for one owner:
+    manual override → owner.email → owner.all_emails → co-owner emails."""
+    seen: set[str] = set()
+    raw: list[str] = []
+
+    def push(addr):
+        a = (addr or "").strip().lower()
+        if a and a not in seen:
+            seen.add(a)
+            raw.append(a)
+
+    push(manual_override)
+    push(owner.get("email"))
+    owner_name = (owner.get("name") or "").strip()
+    if owner_name:
+        ll = agent_cache.get_landlord_by_name(owner_name) or {}
+        push(ll.get("email"))
+        for e in ll.get("all_emails") or []:
+            push(e)
+        for co in agent_cache.get_coowners(owner_name):
+            push(co.get("email"))
+    return [a for a in raw if _validate_email_deliverable(a)]
+
+
 @callback(
     Output("draft-send-status", "children"),
-    Output("email-sent-signal", "data"),
-    Output("shortlist-store", "data", allow_duplicate=True),
     Input("draft-send-btn", "n_clicks"),
     State("shortlist-store", "data"),
     State({"type": "owner-email", "id": ALL}, "value"),
@@ -3578,99 +3634,165 @@ def render_send_summary(shortlist, email_values):
     prevent_initial_call=True,
 )
 def send_draft(_n, shortlist, email_values, email_ids, subject_tpl, body_tpl):
+    """Dispatch the first candidate for each owner via Resend and persist a
+    job row. Delivery + bounce/retry happen asynchronously in the webhook
+    handler; toasts surface progress to the UI via the polling callback."""
     if not shortlist:
-        return dbc.Alert("Shortlist is empty.", color="warning", duration=4000), no_update, no_update
-    email_user = os.getenv("EMAIL_USER", "").strip()
-    email_pass = os.getenv("EMAIL_APP_PASSWORD", "").strip()
-    if not email_user or not email_pass:
+        return dbc.Alert("Shortlist is empty.", color="warning", duration=4000)
+    if not os.getenv("RESEND_API_KEY", "").strip():
         return dbc.Alert(
-            "Set EMAIL_USER and EMAIL_APP_PASSWORD in your .env file.",
+            "Set RESEND_API_KEY and RESEND_FROM_ADDRESS in your .env file.",
             color="danger",
-        ), no_update, no_update
+        )
     if not (subject_tpl or "").strip() or not (body_tpl or "").strip():
         return dbc.Alert(
             "Subject and body must be non-empty before sending.",
             color="warning",
             duration=5000,
-        ), no_update, no_update
-    sender_name = os.getenv("SENDER_NAME", "Sam Shersher")
+        )
 
-    # Map current owner-email input values by owner_key (input ids are dicts).
     owner_email_by_key = {
         eid.get("id"): (val or "").strip()
         for eid, val in zip(email_ids or [], email_values or [])
     }
 
-    queue = []
+    dispatched, skipped, errors = 0, 0, []
     for owner in shortlist:
-        key = owner.get("owner_key")
-        addr = owner_email_by_key.get(key, "")
-        if not addr or not _EMAIL_VALIDATE_RE.match(addr):
+        owner_key = owner.get("owner_key") or ""
+        owner_name = owner.get("name") or ""
+        candidates = _build_email_candidates(
+            owner, owner_email_by_key.get(owner_key)
+        )
+        if not candidates:
+            skipped += 1
             continue
-        queue.append((owner, addr))
+        ctx_vars = _build_owner_ctx(owner)
+        subject = _interpolate(subject_tpl, ctx_vars).strip() or "Inquiry"
+        body = _interpolate(body_tpl, ctx_vars)
+        first_addr = candidates[0]
+        try:
+            msg_id = email_sender.send(first_addr, subject, body)
+        except Exception as e:
+            errors.append(f"{owner_name or '?'}: {e}")
+            job_id = agent_cache.create_outreach_job(
+                owner_key, owner_name, candidates, subject, body, None,
+            )
+            agent_cache.record_outreach_event(
+                job_id, owner_name, "error", addr=first_addr, note=str(e),
+            )
+            continue
+        job_id = agent_cache.create_outreach_job(
+            owner_key, owner_name, candidates, subject, body, msg_id,
+        )
+        agent_cache.record_outreach_event(
+            job_id, owner_name, "dispatched", addr=first_addr,
+        )
+        dispatched += 1
 
-    if not queue:
+    if dispatched == 0 and not errors:
         return dbc.Alert(
-            "No valid recipient emails — fill in the per-owner email fields above.",
+            "No valid recipient emails — no owner had a deliverable address.",
             color="warning",
-            duration=5000,
-        ), no_update, no_update
-
-    sent, failed, errors = 0, 0, []
-    sent_keys: set[str] = set()
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=30) as server:
-            server.login(email_user, email_pass)
-            for owner, to_addr in queue:
-                ctx = _build_owner_ctx(owner)
-                subject = _interpolate(subject_tpl, ctx).strip() or "Inquiry"
-                body = _interpolate(body_tpl, ctx)
-
-                msg = MIMEMultipart()
-                msg["From"] = f"{sender_name} <{email_user}>"
-                msg["To"] = to_addr
-                msg["Subject"] = subject
-                msg["Reply-To"] = email_user
-                msg.attach(MIMEText(body, "plain", _charset="utf-8"))
-
-                try:
-                    server.sendmail(email_user, [to_addr], msg.as_string())
-                    sent += 1
-                    sent_keys.add(owner.get("owner_key"))
-                    agent_cache.mark_email_sent(owner.get("name") or "")
-                except Exception as e:
-                    failed += 1
-                    errors.append(f"{owner.get('name', '?')}: {e}")
-    except smtplib.SMTPAuthenticationError:
-        return dbc.Alert(
-            "Gmail rejected the login. Use an App Password "
-            "(Google Account → Security → App Passwords), not your normal password.",
-            color="danger",
-        ), no_update, no_update
-    except Exception as e:
-        return dbc.Alert(f"SMTP error: {e}", color="danger"), no_update, no_update
-
-    if sent:
-        signal = int(time.time())
-        next_shortlist = [o for o in shortlist if o.get("owner_key") not in sent_keys]
-    else:
-        signal = no_update
-        next_shortlist = no_update
-
-    if failed:
+            duration=6000,
+        )
+    if errors:
         return dbc.Alert(
             [
-                html.Div(f"Sent {sent} · Failed {failed}"),
+                html.Div(f"Dispatched {dispatched} · Errors {len(errors)} · Skipped {skipped}"),
                 html.Small("; ".join(errors[:3]), className="d-block mt-1"),
+                html.Small("Bounces will retry the next candidate automatically.",
+                           className="d-block text-secondary"),
             ],
             color="warning",
             duration=10000,
-        ), signal, next_shortlist
+        )
     return dbc.Alert(
-        f"Sent {sent} email{'s' if sent != 1 else ''} from {email_user}.",
-        color="success",
-        duration=6000,
-    ), signal, next_shortlist
+        [
+            html.Div(
+                f"Dispatched {dispatched} email"
+                f"{'s' if dispatched != 1 else ''}; "
+                f"awaiting delivery confirmation."
+            ),
+            html.Small(
+                f"{skipped} skipped (no deliverable address)"
+                if skipped else "",
+                className="d-block text-secondary",
+            ),
+        ],
+        color="info",
+        duration=8000,
+    )
+
+
+# ── Resend webhook ─────────────────────────────────────────────────────
+
+
+def _advance_outreach_job_on_bounce(job: dict) -> None:
+    """Move to the next candidate for `job` and dispatch it, or mark the job
+    exhausted when no candidates remain."""
+    next_idx = job["current_index"] + 1
+    if next_idx >= len(job["candidates"]):
+        agent_cache.update_outreach_job(job["id"], status="exhausted")
+        agent_cache.record_outreach_event(
+            job["id"], job["owner_name"], "exhausted",
+            addr=job["candidates"][job["current_index"]],
+        )
+        return
+    next_addr = job["candidates"][next_idx]
+    prev_addr = job["candidates"][job["current_index"]]
+    try:
+        new_msg_id = email_sender.send(next_addr, job["subject"], job["body"])
+    except Exception as e:
+        agent_cache.update_outreach_job(
+            job["id"], current_index=next_idx, status="error",
+        )
+        agent_cache.record_outreach_event(
+            job["id"], job["owner_name"], "error",
+            addr=next_addr, note=str(e),
+        )
+        return
+    agent_cache.update_outreach_job(
+        job["id"], current_index=next_idx, last_message_id=new_msg_id,
+        status="pending",
+    )
+    agent_cache.record_outreach_event(
+        job["id"], job["owner_name"], "bounced_retrying",
+        addr=prev_addr, next_addr=next_addr,
+    )
+
+
+@app.server.route("/webhooks/resend", methods=["POST"])
+def resend_webhook():
+    """Receive Resend delivery/bounce events and advance outreach jobs.
+
+    Returns 204 on success so the provider doesn't retry; rejects unsigned or
+    stale requests with 401.
+    """
+    try:
+        email_sender.verify_webhook(request.headers, request.get_data())
+    except ValueError as e:
+        return (f"signature: {e}", 401)
+    event = request.get_json(silent=True) or {}
+    etype = event.get("type", "")
+    data = event.get("data") or {}
+    msg_id = data.get("email_id") or data.get("id") or ""
+    job = agent_cache.find_outreach_job_by_message_id(msg_id)
+    if not job:
+        return ("", 204)
+    current_addr = job["candidates"][job["current_index"]] \
+        if job["candidates"] else None
+    if etype == "email.delivered":
+        if job["status"] == "pending":
+            agent_cache.update_outreach_job(job["id"], status="delivered")
+            agent_cache.mark_email_sent(job["owner_name"])
+            agent_cache.record_outreach_event(
+                job["id"], job["owner_name"], "delivered", addr=current_addr,
+            )
+    elif etype in ("email.bounced", "email.complained"):
+        if job["status"] == "pending":
+            _advance_outreach_job_on_bounce(job)
+    # Other event types (sent, opened, clicked) are ignored.
+    return ("", 204)
 
 
 # ── Subway stop click → radius selection ──────────────────────────────────
