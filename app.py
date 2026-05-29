@@ -170,13 +170,31 @@ def _save_last_template(subject: str, body: str) -> None:
 
 _LAST_TEMPLATE = _load_last_template()
 
-df = pd.read_csv(BASE_DIR / "bklyn_rent_stabilized_buildings.csv")
+# Borough name → BBL borough digit (Manhattan=1, Bronx=2, Brooklyn=3,
+# Queens=4, Staten Island=5). Same map used in agent_cache for portfolio fanout.
+BOROUGH_DIGIT = {
+    "MANHATTAN": "1", "BRONX": "2", "BROOKLYN": "3",
+    "QUEENS": "4", "STATEN ISLAND": "5",
+}
+
+SOURCE_DATA_DIR = BASE_DIR / "source_data"
+RSB_CSVS = [
+    SOURCE_DATA_DIR / "bklyn_rent_stabilized_buildings.csv",
+    SOURCE_DATA_DIR / "NYC_Rent_Stabilized_Buildings_Manhattan.csv",
+]
+df = pd.concat([pd.read_csv(p) for p in RSB_CSVS], ignore_index=True)
 df = df.dropna(subset=["LATITUDE", "LONGITUDE", "BLOCK", "LOT"])
 df["BLOCK"] = df["BLOCK"].astype(int)
 df["LOT"]   = df["LOT"].astype(int)
-df["id"] = df["BLOCK"].astype(str) + "-" + df["LOT"].astype(str)
+df["borough"] = df["BOROUGH"].str.strip()
+df["boro"] = df["borough"].str.upper().map(BOROUGH_DIGIT)
+df = df.dropna(subset=["boro"])
+# Borough-qualified id: identical block/lot exist across boroughs, so the
+# borough digit must be part of the key or FEATURES_BY_ID entries collide.
+df["id"] = df["boro"] + "-" + df["BLOCK"].astype(str) + "-" + df["LOT"].astype(str)
 df["address"] = (
-    df["BUILDING_NO"].astype(str) + " " + df["STREET"].str.strip() + ", Brooklyn"
+    df["BUILDING_NO"].astype(str) + " " + df["STREET"].str.strip()
+    + ", " + df["borough"]
 )
 df["statuses"] = (
     df[["STATUS1", "STATUS2", "STATUS3"]]
@@ -204,6 +222,7 @@ ALL_FEATURES = [
             "id": row["id"],
             "address": row["address"],
             "zip": row["zip"],
+            "boro": row["boro"],
             "block": str(row["BLOCK"]),
             "lot": str(row["LOT"]),
             "statuses": row["statuses"],
@@ -240,7 +259,7 @@ def load_geojson(path):
 
 SUBWAY_GEOJSON = load_geojson(DATA_DIR / "subway-stops.geojson")
 ROUTES_GEOJSON = load_geojson(DATA_DIR / "subway-routes.geojson")
-ZIP_GEOJSON    = load_geojson(DATA_DIR / "brooklyn-zips.geojson")
+ZIP_GEOJSON    = load_geojson(DATA_DIR / "nyc-zips.geojson")
 EMPTY_GEOJSON  = {"type": "FeatureCollection", "features": []}
 
 # ── JavaScript for custom markers ─────────────────────────────────────────
@@ -396,7 +415,7 @@ function(feature, layer, context) {
 NAVBAR = dbc.Navbar(
     dbc.Container(
         [
-            dbc.NavbarBrand("House Me Daddy", className="fw-bold me-3"),
+            dbc.NavbarBrand("House Me Pls", className="fw-bold me-3"),
             html.Span(id="nav-count", className="text-secondary small me-auto"),
             dbc.Button(
                 "⚙",
@@ -805,8 +824,8 @@ SIDEBAR = html.Div(
 
 MAP_AREA = dl.Map(
     id="main-map",
-    center=[40.6501, -73.9496],
-    zoom=12,
+    center=[40.71, -73.97],
+    zoom=11,
     scrollWheelZoom=False,
     style={"height": "100%", "flex": "1"},
     children=[
@@ -1108,7 +1127,7 @@ app = dash.Dash(
     __name__,
     external_stylesheets=[dbc.themes.DARKLY],
     suppress_callback_exceptions=True,
-    title="Brooklyn RSB Finder",
+    title="NYC RSB Finder",
 )
 
 app.layout = html.Div(
@@ -1179,7 +1198,10 @@ SELECTED_CARD_LIMIT = 200
 
 def _bbl_for(props: dict) -> str:
     try:
-        return f'3-{int(float(props.get("block", ""))):05d}-{int(float(props.get("lot", ""))):04d}'
+        boro = str(props.get("boro") or "").strip()
+        if not boro:
+            return ""
+        return f'{boro}-{int(float(props.get("block", ""))):05d}-{int(float(props.get("lot", ""))):04d}'
     except (ValueError, TypeError):
         return ""
 

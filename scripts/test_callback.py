@@ -39,9 +39,9 @@ WRITE_BASE = CALLBACK_PUBLIC_URL or CALLBACK_LOCAL_URL
 
 
 def first_bbl() -> str:
-    df = pd.read_csv(ROOT / "bklyn_rent_stabilized_buildings.csv").dropna(
-        subset=["LATITUDE", "LONGITUDE"]
-    )
+    df = pd.read_csv(
+        ROOT / "source_data" / "bklyn_rent_stabilized_buildings.csv"
+    ).dropna(subset=["LATITUDE", "LONGITUDE"])
     row = df.iloc[0]
     return f'3-{int(row["BLOCK"]):05d}-{int(row["LOT"]):04d}'
 

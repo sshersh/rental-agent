@@ -1,10 +1,10 @@
 # Rent Stabilize Finder
 
-A Dash web app that maps every rent-stabilized building in Brooklyn and, on click, runs a Claude agent that figures out who owns the building and surfaces their public contact info — so a tenant or organizer can reach the actual landlord behind the LLC.
+A Dash web app that maps every rent-stabilized building in Manhattan and Brooklyn and, on click, runs a Claude agent that figures out who owns the building and surfaces their public contact info — so a tenant or organizer can reach the actual landlord behind the LLC.
 
 ## What it does
 
-- Renders ~30k Brooklyn rent-stabilized buildings on a Leaflet map, filterable by ZIP and viewport.
+- Renders ~31k Manhattan + Brooklyn rent-stabilized buildings on a Leaflet map, filterable by ZIP and viewport.
 - On building click, kicks off an agentic landlord lookup that:
   1. Scrapes [Who Owns What](https://whoownswhat.justfix.org) for owner names + building stats (units, violations, evictions, portfolio).
   2. Splits the owner list into individuals vs. LLCs.
@@ -47,7 +47,7 @@ Then open <http://localhost:8050>. On the first landlord lookup, sign in to Cont
 
 ## Design brief
 
-**Frontend.** A single-page Dash app (`app.py`) using `dash-leaflet` for the map and `dash-bootstrap-components` for the chrome. All filtering is done client-side over a pre-built GeoJSON of buildings loaded from `bklyn_rent_stabilized_buildings.csv`. A polling job-tracker panel tails per-lookup log files so the user can watch the agent work in real time.
+**Frontend.** A single-page Dash app (`app.py`) using `dash-leaflet` for the map and `dash-bootstrap-components` for the chrome. All filtering is done client-side over a pre-built GeoJSON of buildings concatenated from the per-borough CSVs in `source_data/` (one for Manhattan, one for Brooklyn). Each building's `id`/BBL is borough-qualified (`1-` Manhattan, `3-` Brooklyn) so identical block/lot numbers across boroughs don't collide. A polling job-tracker panel tails per-lookup log files so the user can watch the agent work in real time.
 
 **Agent layer.** `agent_runner.py` wraps the Claude Agent SDK and invokes the `landlord-lookup` skill (`.claude/skills/landlord-lookup/SKILL.md`) against `claude-haiku-4-5` — the workflow is mechanical (call tools in sequence, apply thresholds, emit JSON), so Sonnet's extra reasoning isn't worth its model-time cost. The skill body is inlined into the system prompt to skip a Skill-tool round-trip, and tool schemas are pre-loaded to skip ToolSearch round-trips.
 
@@ -58,3 +58,7 @@ Then open <http://localhost:8050>. On the first landlord lookup, sign in to Cont
 **Persistence.** `agent_cache.py` is a SQLite cache with a normalized schema: `results` (one row per BBL), `landlords` (deduped by name), `building_landlords` (join), `portfolio` (one row per portfolio member). A successful lookup also fans out to every portfolio building present in the rent-stab CSV, so clicking one building from a large portfolio warms the cache for the rest.
 
 **Concurrency.** `agent_runner.py` starts a single asyncio event loop on a daemon thread; every lookup runs as a coroutine on it via `run_coroutine_threadsafe`. N agents reason in parallel against the Claude API while serializing only at the shared ContactOut page (lock-held for ~10–30s per owner; model thinking happens off-lock). In-flight count is capped by a user-configurable "Max parallel landlord lookups" number input in the settings modal (default 3, persisted to localStorage). The frontend polls `/api/result/:bbl` and tails `.agent_logs/<bbl>.log` for live status; the job-tracker panel renders each log line with colored spans (timestamp blue, event-type label yellow) so the eye can jump between model thinking and tool I/O at a glance.
+
+## Data
+
+The rent-stabilized building lists in `source_data/` come from the **NYC Rent-Stabilized Buildings Data Normalization Project** — thanks to that project for compiling and geocoding the underlying data. ZIP boundaries and subway stops are downloaded by `scripts/setup_data.py` from NYC Open Data and OpenStreetMap.

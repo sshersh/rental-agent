@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Download geodata for the Brooklyn Rent Stabilized Finder.
+"""Download geodata for the NYC (Manhattan + Brooklyn) Rent Stabilized Finder.
 
 Sources:
   Subway stations  — OpenStreetMap Overpass API (public, no key needed)
@@ -17,12 +17,14 @@ def fetch_subway_stations() -> dict:
     """Query OSM Overpass for NYC subway stations."""
     print("Downloading NYC subway stations (OpenStreetMap)...")
     overpass_url = "https://overpass.kumi.systems/api/interpreter"
-    headers = {"User-Agent": "BrooklynRSBFinder/1.0"}
-    # Three overlapping boxes to cover all of Brooklyn without hitting Overpass timeouts
+    headers = {"User-Agent": "NYCRSBFinder/1.0"}
+    # Overlapping boxes covering Manhattan + Brooklyn without hitting Overpass timeouts
     boxes = [
         (40.57, -74.04, 40.65, -73.93),  # south Brooklyn
         (40.65, -73.95, 40.74, -73.83),  # northeast Brooklyn / Queens border
         (40.65, -74.04, 40.74, -73.95),  # northwest Brooklyn + downtown
+        (40.70, -74.02, 40.79, -73.91),  # lower + midtown Manhattan
+        (40.79, -73.98, 40.88, -73.91),  # upper Manhattan
     ]
     seen_ids: set[int] = set()
     elements = []
@@ -54,18 +56,19 @@ def fetch_subway_stations() -> dict:
     return {"type": "FeatureCollection", "features": features}
 
 
-def fetch_brooklyn_zips() -> dict:
-    """Download Brooklyn ZIP/ZCTA boundaries from NYC Open Data."""
-    print("Downloading Brooklyn ZIP boundaries (NYC Open Data)...")
+def fetch_nyc_zips() -> dict:
+    """Download Manhattan + Brooklyn ZIP/ZCTA boundaries from NYC Open Data."""
+    print("Downloading Manhattan + Brooklyn ZIP boundaries (NYC Open Data)...")
     # pri4-ifjk = NYC MODZCTA (modified ZIP code tabulation areas)
-    url = "https://data.cityofnewyork.us/resource/pri4-ifjk.json?$limit=200"
+    url = "https://data.cityofnewyork.us/resource/pri4-ifjk.json?$limit=400"
     rows = requests.get(url, timeout=30).json()
-    brooklyn_zips = {str(z) for z in range(11200, 11260)}
+    # Manhattan ZCTAs: 100xx, 101xx, 102xx. Brooklyn ZCTAs: 112xx.
+    wanted_prefixes = ("100", "101", "102", "112")
     features = []
     for row in rows:
         zcta = str(row.get("modzcta", "") or row.get("zcta", ""))
         geom = row.get("the_geom")
-        if zcta in brooklyn_zips and geom:
+        if zcta.startswith(wanted_prefixes) and geom:
             features.append({
                 "type": "Feature",
                 "geometry": geom,
@@ -78,7 +81,7 @@ def fetch_brooklyn_zips() -> dict:
 subway = fetch_subway_stations()
 (DATA_DIR / "subway-stops.geojson").write_text(json.dumps(subway))
 
-zips = fetch_brooklyn_zips()
-(DATA_DIR / "brooklyn-zips.geojson").write_text(json.dumps(zips))
+zips = fetch_nyc_zips()
+(DATA_DIR / "nyc-zips.geojson").write_text(json.dumps(zips))
 
 print("\nDone. Now run:  .venv/bin/python app.py")

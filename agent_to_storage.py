@@ -118,10 +118,10 @@ def translate(agent_json: dict, props: dict) -> dict:
     """
     flat: dict[str, Any] = {}
 
-    bbl = (props.get("bbl")
-           or f"3-{int(props['block']):05d}-{int(props['lot']):04d}"
-           if props.get("block") is not None and props.get("lot") is not None
-           else None)
+    boro = str(props.get("boro") or "").strip()
+    bbl = props.get("bbl")
+    if not bbl and boro and props.get("block") is not None and props.get("lot") is not None:
+        bbl = f"{boro}-{int(props['block']):05d}-{int(props['lot']):04d}"
     if bbl:
         flat["bbl"] = bbl
     if props.get("address"):
