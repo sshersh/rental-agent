@@ -1,4 +1,4 @@
-# Rent Stabilize Finder
+# House Me Pls
 
 A Dash web app that maps every rent-stabilized building in Manhattan and Brooklyn and, on click, runs a Claude agent that figures out who owns the building and surfaces their public contact info — so a tenant or organizer can reach the actual landlord behind the LLC.
 
