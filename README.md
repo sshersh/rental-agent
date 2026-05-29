@@ -10,7 +10,40 @@ A Dash web app that maps every rent-stabilized building in Brooklyn and, on clic
   2. Splits the owner list into individuals vs. LLCs.
   3. Searches ContactOut for each individual and reveals their public emails.
   4. Returns one consolidated JSON record, cached in SQLite for 30 days.
-- Lets the user compose and send an email blast to the discovered owner addresses via Gmail SMTP.
+- Lets the user compose and send an email blast to the discovered owner addresses via Resend.
+
+## Setup
+
+### 1. Required external services
+
+Three accounts need to be wired up before the app is fully functional:
+
+**ContactOut (Basic tier).** Email reveals for individual owners come from ContactOut.
+- Sign up at [contactout.com](https://contactout.com) and subscribe to at least the **Basic** plan — the free tier won't reveal personal emails.
+- There's no API key. The agent drives ContactOut through the headed Chromium window using a persistent browser profile. The first time a lookup runs (or whenever the session expires) the window lands on ContactOut's `/login` page; sign in manually within ~2 minutes and the session cookie is saved to the profile dir, so later runs reuse it.
+
+**Resend (email sending + delivery webhook).** Outreach emails go out via Resend; bounce/delivery events drive automatic retry to the owner's next candidate address.
+- Create an account at [resend.com](https://resend.com) and verify a sending domain (or use Resend's onboarding/sandbox address for testing).
+- Create an API key → `RESEND_API_KEY`.
+- Set `RESEND_FROM_ADDRESS` to an address on your verified domain (optionally `RESEND_FROM_NAME` and `RESEND_REPLY_TO`).
+- In the Resend dashboard, add a **webhook** pointing at `<public-url>/webhooks/resend` (the public URL comes from ngrok below), subscribe it to the `email.delivered`, `email.bounced`, and `email.complained` events, and copy the signing secret into `RESEND_WEBHOOK_SECRET`.
+
+**ngrok (public URL for the webhook).** Resend needs to reach your local server to deliver webhook events, so expose the app's port with a tunnel.
+- Install ngrok and authenticate it: `ngrok config add-authtoken <token>`.
+- Run `ngrok http 8050` (the app's port); ngrok prints a public `https://…ngrok-free.dev` URL.
+- Use `<that-url>/webhooks/resend` as the Resend webhook endpoint above. Reserving a static domain saves you re-editing the Resend webhook on every restart.
+
+### 2. Install & run
+
+```bash
+pip install -r requirements.txt
+playwright install chromium
+cp .env.example .env   # fill in ANTHROPIC_API_KEY and the RESEND_* vars (RESEND_API_KEY,
+                       # RESEND_FROM_ADDRESS, RESEND_WEBHOOK_SECRET)
+python app.py          # the shared Chromium is always headed (Cloudflare requirement)
+```
+
+Then open <http://localhost:8050>. On the first landlord lookup, sign in to ContactOut in the Chromium window when it appears. To receive delivery/bounce events, run `ngrok http 8050` in a second terminal and keep it running alongside the app.
 
 ## Design brief
 
@@ -25,14 +58,3 @@ A Dash web app that maps every rent-stabilized building in Brooklyn and, on clic
 **Persistence.** `agent_cache.py` is a SQLite cache with a normalized schema: `results` (one row per BBL), `landlords` (deduped by name), `building_landlords` (join), `portfolio` (one row per portfolio member). A successful lookup also fans out to every portfolio building present in the rent-stab CSV, so clicking one building from a large portfolio warms the cache for the rest.
 
 **Concurrency.** `agent_runner.py` starts a single asyncio event loop on a daemon thread; every lookup runs as a coroutine on it via `run_coroutine_threadsafe`. N agents reason in parallel against the Claude API while serializing only at the shared ContactOut page (lock-held for ~10–30s per owner; model thinking happens off-lock). In-flight count is capped by a user-configurable "Max parallel landlord lookups" number input in the settings modal (default 3, persisted to localStorage). The frontend polls `/api/result/:bbl` and tails `.agent_logs/<bbl>.log` for live status; the job-tracker panel renders each log line with colored spans (timestamp blue, event-type label yellow) so the eye can jump between model thinking and tool I/O at a glance.
-
-## Setup
-
-```bash
-pip install -r requirements.txt
-playwright install chromium
-cp .env.example .env   # fill in ANTHROPIC_API_KEY, EMAIL_USER, EMAIL_APP_PASSWORD
-python app.py          # the shared Chromium is always headed (Cloudflare requirement)
-```
-
-Then open <http://localhost:8050>.
